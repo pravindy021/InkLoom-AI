@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import Engine, event
 from sqlalchemy.orm import Session, sessionmaker
@@ -8,7 +9,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import API_VERSION, CORS_ORIGINS
 from app.database import Base, engine, get_db
 from app.models import BrandGuideline
-from app.routes import analytics, analysis, guidelines, health, reviews, sources
+from app.routes import analytics, analysis, auth, guidelines, health, reviews, sources
+from app.services.auth_service import bootstrap_admin
 
 SEED_GUIDELINES = [
     {
@@ -58,6 +60,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
                 for item in SEED_GUIDELINES:
                     db.add(BrandGuideline(**item, is_seed=True))
                 db.commit()
+            bootstrap_admin(db)
         finally:
             db.close()
         yield
@@ -74,10 +77,23 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,
-        allow_credentials=False,
+        allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "X-Reviewer"],
     )
+
+    @app.middleware("http")
+    async def validate_session_request_origin(request, call_next):
+        if (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.headers.get("origin") is not None
+            and request.headers.get("origin") not in CORS_ORIGINS
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Request origin is not allowed for this session."},
+            )
+        return await call_next(request)
 
     def get_app_db():
         db: Session = local_sessions()
@@ -88,6 +104,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
 
     app.dependency_overrides[get_db] = get_app_db
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(guidelines.router)
     app.include_router(analysis.router)
     app.include_router(reviews.router)

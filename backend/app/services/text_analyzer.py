@@ -3,7 +3,11 @@ from datetime import date, datetime
 from typing import Dict, List, Optional, Sequence
 
 from app.models.brand_guideline import BrandGuideline
-from app.services.claim_checker import check_promotional_claims, factual_claim_excerpt
+from app.services.claim_checker import (
+    check_promotional_claims,
+    factual_claim_excerpt,
+    factual_claim_excerpts,
+)
 from app.services.suggestion_engine import (
     claim_suggestion,
     factual_suggestion,
@@ -36,8 +40,9 @@ def _factual_guideline(
     text: str,
     guidelines: Sequence[BrandGuideline],
     evidence_matches: Optional[Sequence[dict]] = None,
+    excerpt_override: Optional[str] = None,
 ) -> Optional[tuple]:
-    excerpt = factual_claim_excerpt(text)
+    excerpt = excerpt_override or factual_claim_excerpt(text)
     if not excerpt:
         return None
     evidence_matches = evidence_matches or []
@@ -45,18 +50,42 @@ def _factual_guideline(
         current_matches = [
             item for item in evidence_matches if item.get("freshness") == "current"
         ]
-        selected = current_matches or list(evidence_matches)
+        undated_matches = [
+            item for item in evidence_matches if item.get("freshness") == "no_expiry_date"
+        ]
+        unknown_date_matches = [
+            item for item in evidence_matches if item.get("freshness") == "unknown"
+        ]
+        selected = (
+            current_matches
+            or undated_matches
+            or unknown_date_matches
+            or list(evidence_matches)
+        )
         source_names = ", ".join(str(item.get("name") or "approved source") for item in selected)
         guideline_ids = [
             item.get("guideline_id")
             for item in selected
             if item.get("guideline_id") is not None
         ]
-        if current_matches:
+        if current_matches or undated_matches:
+            freshness_note = (
+                "A current approved source excerpt matched this statement"
+                if current_matches
+                else "An approved source excerpt with no recorded expiry date matched this statement"
+            )
             return (
                 excerpt,
-                "A current approved source excerpt matched this statement ({}). "
-                "Compare exact scope and context before publication; this match is not verification."
+                "{} ({}). Compare exact scope and context before publication; "
+                "this match is not verification.".format(freshness_note, source_names),
+                guideline_ids[0] if guideline_ids else None,
+                source_names,
+            )
+        if unknown_date_matches:
+            return (
+                excerpt,
+                "A result from a configured trusted source may be relevant ({}). "
+                "Confirm the source and claim context before publication."
                 .format(source_names),
                 guideline_ids[0] if guideline_ids else None,
                 source_names,
@@ -106,7 +135,14 @@ def _factual_guideline(
                 item.id,
                 item.name,
             )
-    return None
+    names = ", ".join(item.name for item in relevant)
+    return (
+        excerpt,
+        "Approved evidence references are configured ({}), but no matching approved-source excerpt was found for this statement."
+        .format(names),
+        relevant[0].id,
+        relevant[0].name,
+    )
 
 
 def analyze_text(
@@ -115,6 +151,7 @@ def analyze_text(
     image_attached: bool = False,
     alt_text: Optional[str] = None,
     evidence_matches: Optional[Sequence[dict]] = None,
+    evidence_by_claim: Optional[Dict[str, Sequence[dict]]] = None,
 ) -> List[Dict[str, object]]:
     findings: List[Dict[str, object]] = []
 
@@ -156,32 +193,43 @@ def analyze_text(
                 finding["guideline"] = claim_guideline.name
                 finding["guideline_id"] = claim_guideline.id
 
-    factual = _factual_guideline(text, guidelines, evidence_matches)
-    factual_is_covered_by_claim_rule = bool(
-        factual
-        and any(
+    for excerpt in factual_claim_excerpts(text):
+        if any(
             finding["category"] == "unsupported_claim"
             and finding["matched_text"]
-            and str(factual[0]).lower() in str(finding["matched_text"]).lower()
+            and (
+                excerpt.casefold() in str(finding["matched_text"]).casefold()
+                or str(finding["matched_text"]).casefold() in excerpt.casefold()
+            )
             for finding in findings
+        ):
+            continue
+        if evidence_by_claim is not None:
+            claim_evidence = evidence_by_claim.get(excerpt.casefold(), [])
+        else:
+            claim_evidence = evidence_matches
+        factual = _factual_guideline(
+            text,
+            guidelines,
+            claim_evidence,
+            excerpt_override=excerpt,
         )
-    )
-    if factual and not factual_is_covered_by_claim_rule:
-        excerpt, explanation, guideline_id, source = factual
-        findings.append(
-            {
-                "category": "factual_claim",
-                "severity": "medium",
-                "title": "Verify factual statement",
-                "explanation": explanation,
-                "matched_text": excerpt,
-                "suggestion": factual_suggestion(),
-                "source": source,
-                "guideline": source,
-                "guideline_id": guideline_id,
-                "confidence": 0.62,
-            }
-        )
+        if factual:
+            _excerpt, explanation, guideline_id, source = factual
+            findings.append(
+                {
+                    "category": "factual_claim",
+                    "severity": "medium",
+                    "title": "Verify factual statement",
+                    "explanation": explanation,
+                    "matched_text": excerpt,
+                    "suggestion": factual_suggestion(),
+                    "source": source,
+                    "guideline": source,
+                    "guideline_id": guideline_id,
+                    "confidence": 0.62,
+                }
+            )
 
     click_here = re.search(r"\bclick here\b", text, re.IGNORECASE)
     if click_here:

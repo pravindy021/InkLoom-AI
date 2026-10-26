@@ -9,8 +9,14 @@ from app.models.brand_guideline import BrandGuideline
 from app.models.source_document import SourceDocument
 from app.schemas.sources import SourceCreate
 from app.services.document_ingestion import extract_source_text
+from app.models.user import User
+from app.services.auth_service import require_roles
 
-router = APIRouter(prefix="/api/sources", tags=["approved sources"])
+router = APIRouter(
+    prefix="/api/sources",
+    tags=["approved sources"],
+    dependencies=[Depends(require_roles("admin", "reviewer", "contributor"))],
+)
 
 
 def _serialize(source: SourceDocument):
@@ -38,7 +44,11 @@ def list_sources(
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_source(payload: SourceCreate, db: Session = Depends(get_db)):
+def create_source(
+    payload: SourceCreate,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
+):
     if payload.guideline_id is not None and db.get(BrandGuideline, payload.guideline_id) is None:
         raise HTTPException(status_code=422, detail="The selected guideline does not exist.")
     source = SourceDocument(**payload.model_dump())
@@ -57,6 +67,7 @@ async def upload_source(
     source_date: date = Form(default=None),
     expiry_date: date = Form(default=None),
     db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
 ):
     filename = (file.filename or "").replace("\\", "/").split("/")[-1].strip()
     if not filename or any(ord(char) < 32 for char in filename):
@@ -87,7 +98,11 @@ async def upload_source(
 
 
 @router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_source(source_id: int, db: Session = Depends(get_db)):
+def delete_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
+):
     source = db.get(SourceDocument, source_id)
     if source is None:
         raise HTTPException(status_code=404, detail="Approved source not found.")

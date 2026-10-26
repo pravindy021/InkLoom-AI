@@ -38,7 +38,36 @@ CLAIM_PATTERNS = [
         "This absolute claim implies that all problems or risks are eliminated.",
         0.92,
     ),
-]
+    (
+        re.compile(
+            r"\b(?:guarantees?|guaranteed)\s+(?:\d{1,3}\s*%\s+)?"
+            r"(?:accurate answers?|accuracy|accurate results?)\b[^.!?;]{0,80}",
+            re.IGNORECASE,
+        ),
+        "Unverified accuracy claim",
+        "An absolute accuracy promise requires appropriate supporting evidence.",
+        0.96,
+    ),
+    (
+        re.compile(
+            r"\b(?:increase|boost|grow|raise)\s+(?:your\s+)?"
+            r"(?:business\s+)?revenue\s+by\s+\d+(?:\.\d+)?\s*%"
+            r"[^.!?;]{0,80}",
+            re.IGNORECASE,
+        ),
+        "Unverified revenue claim",
+        "A specific revenue increase should be supported by approved evidence.",
+        0.94,
+    ),
+    (
+        re.compile(
+            r"\b(?:world['’]s\s+best|no\.?\s*1|number one|#1)\b",
+            re.IGNORECASE,
+        ),
+        "Unsubstantiated superlative",
+        "A market-leading claim needs documented, current supporting evidence.",
+        0.91,
+    )]
 
 
 def check_promotional_claims(text: str) -> List[Dict[str, object]]:
@@ -80,3 +109,37 @@ def factual_claim_excerpt(text: str) -> Optional[str]:
     )
     match = next(candidates, None)
     return match.group(0).strip() if match else None
+
+
+def factual_claim_excerpts(text: str) -> List[str]:
+    claim_pattern = re.compile(
+        r"(?:\d+(?:\.\d+)?\s*%|\$[\d,]+|\b\d{4}\b|\baccording to\b|"
+        r"\bresearch shows\b|\bstudies show\b|\bscientifically proven\b|"
+        r"\bnumber one\b|#1)",
+        re.IGNORECASE,
+    )
+
+    instruction_pattern = re.compile(
+        r"^\s*(?:(?:rule|guideline|policy)\s*#?\s*\d*\s*[:.)-]\s*|"
+        r"(?:never|do not|don't|avoid|must not|should not)\s+"
+        r"(?:claim|state|say|promise|advertise|assert|describe|use|write|mention)\b)",
+        re.IGNORECASE,
+    )
+
+    claims = []
+    seen = set()
+
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        candidate = sentence.strip()
+        normalized = candidate.casefold()
+
+        if (
+            candidate
+            and claim_pattern.search(candidate)
+            and not instruction_pattern.search(candidate)
+            and normalized not in seen
+        ):
+            claims.append(candidate)
+            seen.add(normalized)
+
+    return claims

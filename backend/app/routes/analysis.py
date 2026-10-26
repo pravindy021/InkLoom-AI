@@ -8,21 +8,44 @@ from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
 
-from app.config import MAX_CONTENT_LENGTH, MAX_UPLOAD_SIZE, OCR_ENABLED
+from app.config import (
+    FACT_CHECK_ENABLED,
+    FACT_CHECK_PROVIDER,
+    MAX_CONTENT_LENGTH,
+    MAX_UPLOAD_SIZE,
+    OCR_ENABLED,
+    TRUSTED_SOURCE_DOMAINS,
+)
 from app.database import get_db
 from app.models.brand_guideline import BrandGuideline
 from app.models.content_review import ContentReview, ReviewFinding
 from app.models.source_document import SourceDocument
+from app.models.user import User
 from app.schemas.analysis import AnalysisRequest
 from app.services.activity_service import record_activity
-from app.services.image_analyzer import inspect_image
+from app.services.image_analyzer import (
+    ImageAnalysisConfigurationError,
+    inspect_image,
+)
 from app.services.review_service import finding_payload
-from app.services.claim_checker import factual_claim_excerpt
-from app.services.source_retrieval import retrieve_evidence
+from app.services.claim_checker import check_promotional_claims, factual_claim_excerpts
+from app.services.factual_verifier import (
+    ExternalSearchError,
+    MAX_EXTERNAL_CLAIMS,
+    search_trusted_sources,
+    verification_fields,
+)
+from app.services.source_retrieval import (
+    EmbeddingProviderError,
+    retrieve_evidence,
+    retrieval_method,
+)
 from app.services.llm_analyzer import LLMProviderError, analyze_with_llm, llm_enabled
 from app.services.text_analyzer import analyze_text
+from app.services.auth_service import require_roles
 
 router = APIRouter(prefix="/api", tags=["analysis"])
+MAX_LOCAL_CLAIMS = 20
 
 
 async def _parse_request(request: Request):
@@ -64,6 +87,7 @@ async def _parse_request(request: Request):
             "guideline_ids": guideline_ids or [],
             "source_ids": _parse_id_list(form.get("source_ids", "[]"), "source_ids"),
             "alt_text": form.get("alt_text"),
+            "allow_external_verification": form.get("allow_external_verification", "false"),
         }
         uploaded = form.get("file")
         if uploaded is not None:
@@ -113,7 +137,11 @@ def _parse_id_list(value, field_name: str):
 
 
 @router.post("/analyze")
-async def analyze_content(request: Request, db: Session = Depends(get_db)):
+async def analyze_content(
+    request: Request,
+    db: Session = Depends(get_db),
+    analyst: User = Depends(require_roles("admin", "reviewer", "contributor")),
+):
     payload, image_bytes = await _parse_request(request)
     if payload.guideline_ids:
         guidelines = (
@@ -148,15 +176,69 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
                 status_code=422,
                 detail="Unknown source id(s): {}.".format(", ".join(map(str, missing_source_ids))),
             )
-    factual_excerpt = factual_claim_excerpt(payload.content)
-    evidence_matches = (
-        retrieve_evidence(factual_excerpt, sources) if factual_excerpt else []
+    claim_candidates = factual_claim_excerpts(payload.content) + [
+        str(item["matched_text"])
+        for item in check_promotional_claims(payload.content)
+        if item.get("matched_text")
+    ]
+    claim_candidates = list(dict.fromkeys(claim_candidates))
+    evidence_by_claim = {}
+    evidence_matches = []
+    evidence_retrieval_method = retrieval_method()
+    external_failure = False
+    external_claims_searched = 0
+    external_claims_attempted = 0
+    external_search_candidates = (
+        min(len(claim_candidates), MAX_EXTERNAL_CLAIMS)
+        if payload.allow_external_verification and FACT_CHECK_ENABLED
+        else 0
     )
+    for index, claim in enumerate(claim_candidates[:MAX_LOCAL_CLAIMS]):
+        try:
+            local_matches, evidence_retrieval_method = await retrieve_evidence(
+                claim, sources, db
+            )
+        except EmbeddingProviderError as exc:
+            db.rollback()
+            raise HTTPException(status_code=502, detail=str(exc))
+        claim_evidence = list(local_matches)
+        if (
+            payload.allow_external_verification
+            and FACT_CHECK_ENABLED
+            and index < MAX_EXTERNAL_CLAIMS
+        ):
+            external_claims_attempted += 1
+            try:
+                claim_evidence.extend(await search_trusted_sources(claim))
+                external_claims_searched += 1
+            except ExternalSearchError:
+                external_failure = True
+        evidence_by_claim[claim.casefold()] = claim_evidence
+        for evidence in claim_evidence:
+            evidence_key = (
+                evidence.get("source_type"),
+                evidence.get("id"),
+                evidence.get("url"),
+                evidence.get("excerpt"),
+            )
+            if not any(
+                (
+                    existing.get("source_type"),
+                    existing.get("id"),
+                    existing.get("url"),
+                    existing.get("excerpt"),
+                )
+                == evidence_key
+                for existing in evidence_matches
+            ):
+                evidence_matches.append(evidence)
 
     image_info = None
     if image_bytes is not None:
         try:
             image_info = inspect_image(image_bytes, OCR_ENABLED)
+        except ImageAnalysisConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
 
@@ -170,12 +252,14 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
         image_attached=image_bytes is not None,
         alt_text=payload.alt_text,
         evidence_matches=evidence_matches,
+        evidence_by_claim=evidence_by_claim,
     )
     analysis_engine = "rules"
     if llm_enabled():
         try:
             llm_findings = await analyze_with_llm(payload.content, guidelines, evidence_matches)
         except LLMProviderError as exc:
+            db.rollback()
             raise HTTPException(status_code=502, detail=str(exc))
         known = {
             (
@@ -193,6 +277,32 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
                 findings.append(item)
                 known.add(key)
         analysis_engine = "rules+configured_llm"
+    for finding in findings:
+        if finding.get("category") not in {"factual_claim", "unsupported_claim"}:
+            continue
+        claim = str(finding.get("matched_text") or "").strip()
+        claim_evidence = evidence_by_claim.get(claim.casefold(), [])
+        if not claim_evidence:
+            matching_claim = next(
+                (
+                    candidate
+                    for candidate in claim_candidates
+                    if claim
+                    and (
+                        claim.casefold() in candidate.casefold()
+                        or candidate.casefold() in claim.casefold()
+                    )
+                ),
+                None,
+            )
+            if matching_claim:
+                claim_evidence = evidence_by_claim.get(matching_claim.casefold(), [])
+        verified = verification_fields(claim, claim_evidence)
+        finding.update(verified)
+        finding["confidence"] = verified["verification_confidence"]
+        finding["explanation"] = "{} {}".format(
+            finding["explanation"], verified["verification_explanation"]
+        )
     palette_result = image_info.get("palette_comparison") if image_info else None
     if palette_result and palette_result.get("potential_mismatch"):
         findings.append(
@@ -204,6 +314,35 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
                 "matched_text": None,
                 "suggestion": "Compare the asset with approved brand references and adjust only if the difference is unintended.",
                 "source": "Configured palette RGB-distance heuristic",
+                "guideline": None,
+                "guideline_id": None,
+                "confidence": None,
+            }
+        )
+    asset_similarity = (
+        image_info.get("brand_asset_similarity") if image_info else None
+    )
+    if asset_similarity and asset_similarity.get("potential_mismatch"):
+        best_match = max(
+            item["similarity_percent"]
+            for item in asset_similarity["references"]
+        )
+        findings.append(
+            {
+                "category": "visual_brand",
+                "severity": "low",
+                "title": "Image differs from configured brand asset references",
+                "explanation": (
+                    "The uploaded image's highest coarse visual similarity to a configured "
+                    "reference is {}%, below the configured {}% threshold. This hash heuristic "
+                    "does not determine whether the asset is approved or appropriate."
+                ).format(best_match, asset_similarity["threshold_percent"]),
+                "matched_text": None,
+                "suggestion": (
+                    "Confirm this asset is an approved variant or compare it with the "
+                    "current brand asset library."
+                ),
+                "source": "Configured brand asset difference-hash comparison",
                 "guideline": None,
                 "guideline_id": None,
                 "confidence": None,
@@ -222,6 +361,7 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
         db,
         review.id,
         "analysis_completed",
+        actor=analyst.display_name,
         details={
             "issue_count": len(findings),
             "analysis_engine": analysis_engine,
@@ -242,6 +382,17 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
             source=item["source"],
             confidence=item["confidence"],
             review_status="pending",
+            metadata_json={
+                key: item[key]
+                for key in (
+                    "claim",
+                    "verification_status",
+                    "citations",
+                    "verification_explanation",
+                    "verification_confidence",
+                )
+                if key in item
+            },
         )
         db.add(model)
         finding_models.append(model)
@@ -277,11 +428,34 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
         "findings": [finding_payload(item) for item in finding_models],
         "issues": [finding_payload(item) for item in finding_models],
         "retrieved_evidence": evidence_matches,
-        "factual_verification": (
-            "candidate_evidence_requires_human_review"
-            if evidence_matches
-            else "unverified_no_relevant_approved_source_found"
-        ),
+        "evidence_retrieval_method": evidence_retrieval_method,
+        "factual_verification": "claim_level_verification_advisory",
+        "external_verification": {
+            "requested": payload.allow_external_verification,
+            "enabled": FACT_CHECK_ENABLED,
+            "provider": FACT_CHECK_PROVIDER or None,
+            "trusted_source_domains": list(TRUSTED_SOURCE_DOMAINS),
+            "status": (
+                "not_requested"
+                if not payload.allow_external_verification
+                else "not_configured"
+                if not FACT_CHECK_ENABLED
+                else "provider_error"
+                if external_failure
+                else "partial"
+                if payload.allow_external_verification
+                and len(claim_candidates) > external_search_candidates
+                else "completed"
+            ),
+            "claims_attempted": external_claims_attempted,
+            "claims_searched": external_claims_searched,
+            "claims_failed": external_claims_attempted - external_claims_searched,
+            "claims_not_externally_searched": (
+                max(0, len(claim_candidates) - external_claims_attempted)
+                if payload.allow_external_verification
+                else 0
+            ),
+        },
         "analysis_engine": analysis_engine,
         "analyzed_at": datetime.now(timezone.utc),
         "image_analysis": image_info,

@@ -7,8 +7,13 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.brand_guideline import BrandGuideline
 from app.models.content_review import ContentReview, ReviewFinding
+from app.services.auth_service import require_roles
 
-router = APIRouter(prefix="/api/analytics", tags=["analytics"])
+router = APIRouter(
+    prefix="/api/analytics",
+    tags=["analytics"],
+    dependencies=[Depends(require_roles("admin", "reviewer", "contributor"))],
+)
 
 
 @router.get("/summary")

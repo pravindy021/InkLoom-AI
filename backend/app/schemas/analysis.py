@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -10,6 +10,7 @@ class AnalysisRequest(BaseModel):
     guideline_ids: List[int] = Field(default_factory=list, max_length=100)
     source_ids: List[int] = Field(default_factory=list, max_length=100)
     alt_text: Optional[str] = Field(default=None, max_length=1000)
+    allow_external_verification: bool = False
 
     @field_validator("content")
     @classmethod
@@ -42,3 +43,8 @@ class FindingRead(BaseModel):
     confidence: Optional[float]
     status: str
     review_status: str
+    claim: Optional[str] = None
+    verification_status: Optional[str] = None
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
+    verification_explanation: Optional[str] = None
+    verification_confidence: Optional[float] = None

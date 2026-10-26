@@ -30,7 +30,28 @@ const guidelines = [
 const sources = [];
 
 export const mockApi = {
-  health: () => wait({ status: "ok", mode: "mock" }),
+  health: () => wait({ status: "ok", mode: "mock", password_recovery_enabled: false }),
+  requestPasswordRecovery: async () => {
+    throw new Error("Password recovery is unavailable in mock mode.");
+  },
+  resetPassword: async () => {
+    throw new Error("Password recovery is unavailable in mock mode.");
+  },
+  acceptInvitation: async () => {
+    throw new Error("Invitations are unavailable in mock mode.");
+  },
+  users: async () => {
+    throw new Error("Workspace member management is unavailable in mock mode.");
+  },
+  createUser: async () => {
+    throw new Error("Workspace member management is unavailable in mock mode.");
+  },
+  resendInvitation: async () => {
+    throw new Error("Workspace member management is unavailable in mock mode.");
+  },
+  updateUser: async () => {
+    throw new Error("Workspace member management is unavailable in mock mode.");
+  },
   guidelines: () => wait(guidelines),
   createGuideline: async (data) => {
     const item = { ...data, id: `g${Date.now()}`, status: "approved" };

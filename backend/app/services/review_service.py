@@ -4,7 +4,7 @@ from app.models.content_review import ContentReview
 
 
 def finding_payload(finding: Any) -> Dict[str, Any]:
-    return {
+    payload = {
         "id": finding.id,
         "category": finding.category,
         "severity": finding.severity,
@@ -20,6 +20,8 @@ def finding_payload(finding: Any) -> Dict[str, Any]:
         "status": finding.review_status,
         "review_status": finding.review_status,
     }
+    payload.update(finding.metadata_json or {})
+    return payload
 
 
 def review_payload(review: ContentReview) -> Dict[str, Any]:

@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -11,8 +12,14 @@ from app.services.audit_service import record_status_change
 from app.services.activity_service import record_activity
 from app.services.collaboration import collaboration_hub
 from app.services.review_service import review_payload
+from app.models.user import User
+from app.services.auth_service import authenticate_token, require_roles
+from app.config import CORS_ORIGINS
 
-router = APIRouter(prefix="/api/reviews", tags=["reviews"])
+router = APIRouter(
+    prefix="/api/reviews",
+    tags=["reviews"],
+)
 
 
 def _get_review(db: Session, review_id: int) -> ContentReview:
@@ -37,6 +44,7 @@ def list_reviews(
     limit: int = Query(default=20, ge=1, le=100),
     review_status: str = Query(default=None, alias="status"),
     db: Session = Depends(get_db),
+    _user: User = Depends(require_roles("admin", "reviewer", "contributor")),
 ):
     query = db.query(ContentReview)
     if review_status:
@@ -70,7 +78,11 @@ def list_reviews(
 
 
 @router.get("/{review_id}")
-def get_review(review_id: int, db: Session = Depends(get_db)):
+def get_review(
+    review_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_roles("admin", "reviewer", "contributor")),
+):
     return review_payload(_get_review(db, review_id))
 
 @router.get("/{review_id}/activity")
@@ -79,6 +91,7 @@ def get_review_activity(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
+    _user: User = Depends(require_roles("admin", "reviewer", "contributor")),
 ):
     _get_review(db, review_id)
     entries = (
@@ -103,15 +116,18 @@ def get_review_activity(
 
 @router.patch("/{review_id}/status")
 async def update_status(
-    review_id: int, payload: StatusUpdate, db: Session = Depends(get_db)
+    review_id: int,
+    payload: StatusUpdate,
+    db: Session = Depends(get_db),
+    reviewer: User = Depends(require_roles("admin", "reviewer")),
 ):
     review = _get_review(db, review_id)
-    record_status_change(db, review, payload.status, payload.reviewer)
+    record_status_change(db, review, payload.status, reviewer.display_name)
     record_activity(
         db,
         review.id,
         "status_changed",
-        actor=payload.reviewer,
+        actor=reviewer.display_name,
         details={"status": payload.status},
     )
     db.commit()
@@ -119,20 +135,23 @@ async def update_status(
     serialized = review_payload(_get_review(db, review_id))
     await collaboration_hub.broadcast(
         review_id,
-        {"type": "status_changed", "payload": {"status": payload.status, "reviewer": payload.reviewer}},
+        {"type": "status_changed", "payload": {"status": payload.status, "reviewer": reviewer.display_name}},
     )
     return serialized
 
 
 @router.post("/{review_id}/comments", status_code=status.HTTP_201_CREATED)
 async def add_comment(
-    review_id: int, payload: CommentCreate, db: Session = Depends(get_db)
+    review_id: int,
+    payload: CommentCreate,
+    db: Session = Depends(get_db),
+    author: User = Depends(require_roles("admin", "reviewer", "contributor")),
 ):
     _get_review(db, review_id)
     comment = ReviewComment(
         review_id=review_id,
         comment=payload.comment,
-        author=payload.author,
+        author=author.display_name,
     )
     db.add(comment)
     db.flush()
@@ -140,7 +159,7 @@ async def add_comment(
         db,
         review_id,
         "comment_added",
-        actor=payload.author,
+        actor=author.display_name,
         details={"comment_id": comment.id},
     )
     db.commit()
@@ -159,7 +178,10 @@ async def add_comment(
 
 @router.post("/{review_id}/revisions", status_code=status.HTTP_201_CREATED)
 async def add_revision(
-    review_id: int, payload: RevisionCreate, db: Session = Depends(get_db)
+    review_id: int,
+    payload: RevisionCreate,
+    db: Session = Depends(get_db),
+    author: User = Depends(require_roles("admin", "reviewer", "contributor")),
 ):
     review = _get_review(db, review_id)
     revision = ReviewRevision(
@@ -174,6 +196,7 @@ async def add_revision(
         db,
         review_id,
         "revision_added",
+        actor=author.display_name,
         details={"title": payload.title},
     )
     db.commit()
@@ -197,14 +220,35 @@ async def review_collaboration(websocket: WebSocket, review_id: int, db: Session
     if review is None:
         await websocket.close(code=4404, reason="Review not found.")
         return
-    await collaboration_hub.connect(review_id, websocket)
+    from app.config import AUTH_COOKIE_NAME
+
+    if websocket.headers.get("origin") not in CORS_ORIGINS:
+        await websocket.close(code=4403, reason="Origin is not allowed.")
+        return
+    user = authenticate_token(db, websocket.cookies.get(AUTH_COOKIE_NAME))
+    if user is None:
+        await websocket.close(code=4401, reason="Sign in to collaborate.")
+        return
+    if user.must_change_password:
+        await websocket.close(code=4403, reason="Change your temporary password first.")
+        return
+    await collaboration_hub.connect(review_id, websocket, user.id)
     try:
         await collaboration_hub.broadcast(
             review_id,
             {"type": "presence", "payload": {"event": "joined", "review_id": review_id}},
         )
         while True:
-            raw = await websocket.receive_text()
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=60)
+            except asyncio.TimeoutError:
+                active_user = authenticate_token(
+                    db, websocket.cookies.get(AUTH_COOKIE_NAME)
+                )
+                if active_user is None or active_user.must_change_password:
+                    await websocket.close(code=4401, reason="Workspace session expired.")
+                    break
+                continue
             if len(raw.encode("utf-8")) > 2048:
                 await websocket.send_json({"type": "error", "message": "Message too large."})
                 continue
@@ -226,7 +270,7 @@ async def review_collaboration(websocket: WebSocket, review_id: int, db: Session
                             "type": "draft_changed",
                             "payload": {
                                 "content": message["content"],
-                                "user": str(message.get("user") or "Anonymous reviewer")[:160],
+                                "user": user.display_name,
                             },
                         },
                     )
@@ -238,7 +282,7 @@ async def review_collaboration(websocket: WebSocket, review_id: int, db: Session
             payload = {
                 "type": message["type"],
                 "payload": {
-                    "user": str(message.get("user") or "Anonymous reviewer")[:160],
+                    "user": user.display_name,
                     "active": bool(message.get("active", True)),
                 },
             }
@@ -246,4 +290,4 @@ async def review_collaboration(websocket: WebSocket, review_id: int, db: Session
     except WebSocketDisconnect:
         pass
     finally:
-        await collaboration_hub.disconnect(review_id, websocket)
+        await collaboration_hub.disconnect(review_id, websocket, user.id)

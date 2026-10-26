@@ -4,8 +4,14 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.brand_guideline import BrandGuideline
 from app.schemas.guidelines import GuidelineCreate
+from app.models.user import User
+from app.services.auth_service import require_roles
 
-router = APIRouter(prefix="/api/guidelines", tags=["guidelines"])
+router = APIRouter(
+    prefix="/api/guidelines",
+    tags=["guidelines"],
+    dependencies=[Depends(require_roles("admin", "reviewer", "contributor"))],
+)
 
 
 def serialize_guideline(item: BrandGuideline):
@@ -31,7 +37,11 @@ def list_guidelines(db: Session = Depends(get_db)):
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_guideline(payload: GuidelineCreate, db: Session = Depends(get_db)):
+def create_guideline(
+    payload: GuidelineCreate,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
+):
     item = BrandGuideline(
         name=payload.name,
         category=payload.category,
@@ -50,7 +60,11 @@ def create_guideline(payload: GuidelineCreate, db: Session = Depends(get_db)):
 
 
 @router.delete("/{guideline_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_guideline(guideline_id: int, db: Session = Depends(get_db)):
+def delete_guideline(
+    guideline_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
+):
     item = db.get(BrandGuideline, guideline_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Guideline not found.")
