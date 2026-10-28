@@ -36,6 +36,11 @@ class ContentReview(Base):
     revisions: Mapped[list["ReviewRevision"]] = relationship(
         back_populates="review", cascade="all, delete-orphan", order_by="ReviewRevision.id"
     )
+    analysis_runs: Mapped[list["ReviewAnalysisRun"]] = relationship(
+        back_populates="review",
+        cascade="all, delete-orphan",
+        order_by="ReviewAnalysisRun.id",
+    )
 
 
 class ReviewFinding(Base):
@@ -72,3 +77,24 @@ class ReviewRevision(Base):
     )
 
     review: Mapped[ContentReview] = relationship(back_populates="revisions")
+
+
+class ReviewAnalysisRun(Base):
+    __tablename__ = "review_analysis_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    review_id: Mapped[int] = mapped_column(ForeignKey("content_reviews.id"), index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    findings: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    analysis_engine: Mapped[str] = mapped_column(String(80), nullable=False)
+    evidence_retrieval_method: Mapped[Optional[str]] = mapped_column(String(80))
+    warnings: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    created_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    review: Mapped[ContentReview] = relationship(back_populates="analysis_runs")
+    created_by = relationship("User")

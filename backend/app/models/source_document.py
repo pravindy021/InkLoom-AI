@@ -19,14 +19,50 @@ class SourceDocument(Base):
     url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     source_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     expiry_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    approval_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    reviewed_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    review_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     guideline = relationship("BrandGuideline")
+    reviewed_by = relationship("User")
+    approval_history: Mapped[list["SourceApprovalEvent"]] = relationship(
+        back_populates="source",
+        cascade="all, delete-orphan",
+        order_by="SourceApprovalEvent.id",
+    )
     embeddings = relationship(
         "SourceChunkEmbedding", back_populates="source", cascade="all, delete-orphan"
     )
+
+
+class SourceApprovalEvent(Base):
+    __tablename__ = "source_approval_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_id: Mapped[int] = mapped_column(
+        ForeignKey("source_documents.id", ondelete="CASCADE"), index=True
+    )
+    reviewer_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    source: Mapped[SourceDocument] = relationship(back_populates="approval_history")
+    reviewer = relationship("User")
 
 
 class SourceChunkEmbedding(Base):

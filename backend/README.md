@@ -17,6 +17,17 @@ chmod 600 .env
 uvicorn app.main:app --reload
 ```
 
+### Start an isolated local workspace
+
+To avoid using or changing an existing `inkloom.db`, start a separate development database and enter a local Admin credential interactively:
+
+```bash
+cd backend
+.venv/bin/python run_local.py
+```
+
+The launcher prompts for an Admin email and a password twice; password input is hidden and neither value is written to a file or printed. It uses `inkloom-local-dev.db`, leaving the configured database untouched. Start the frontend separately with `cd frontend && npm run dev`; its default API URL is `http://localhost:8000`. Stop any other API already using port 8000 before starting this local instance. Use the Admin email/password entered at the prompts to sign in. SMTP invitations remain unavailable unless SMTP is separately configured.
+
 Swagger UI is available at `http://localhost:8000/docs`, with OpenAPI JSON at `/openapi.json`. SQLite is created in the backend working directory by default. Configure its location using `DATABASE_URL`.
 
 Authentication is enabled by default. On an empty user database, set `BOOTSTRAP_ADMIN_EMAIL` and a unique `BOOTSTRAP_ADMIN_PASSWORD` of at least 12 characters in `backend/.env`; the first account is created as an administrator at startup. The API loads this file by its path relative to the backend source, independent of the shell's current directory, without overriding environment variables already supplied by the process. Restrict the file to the owner (`chmod 600 .env`); do not commit it or reuse a development password. Bootstrap is intentionally create-only: if any user already exists, it will neither add another bootstrap administrator nor reset an existing account's password. For a database with existing users, sign in with an existing active Admin account. Admins invite accounts from **Admin dashboard → Invite user**; each recipient sets their own password through a single-use email link.
@@ -49,7 +60,9 @@ Authentication is enabled by default. On an empty user database, set `BOOTSTRAP_
 
 Uploaded images are validated and processed in memory and are not persisted. OCR text and findings are persisted as review data. Do not send confidential material to a remote LLM unless your deployment and provider data handling have been reviewed. This MVP does not provide encryption-at-rest guarantees or a retention policy.
 
-Factual verification compares detected numeric and promotional claims with administrator-managed approved source documents. The optional external lookup uses Brave Search only after per-analysis user consent, sends extracted claim text (not the complete draft or image), and only accepts results whose host matches `TRUSTED_SOURCE_DOMAINS`. Provider results are stored as candidate citations with the review. A configured source match is not proof; contradictory/unverified statuses are advisory heuristics, and every publication decision remains with a human reviewer. An external-provider failure leaves the claim unverified and does not block the regular analysis.
+Factual verification compares detected numeric and promotional claims only with source documents explicitly approved by an Admin or Reviewer. New sources and legacy sources discovered during the additive startup migration are pending until reviewed; approval decisions retain the reviewer, timestamp, optional note, and decision history. Pending or rejected sources cannot be selected for analysis or retrieved as evidence. The optional external lookup uses Brave Search only after per-analysis user consent, sends extracted claim text (not the complete draft or image), and only accepts results whose host matches `TRUSTED_SOURCE_DOMAINS`. Provider results are stored as candidate citations with the review. A configured source match is not proof; contradictory/unverified statuses are advisory heuristics, and every publication decision remains with a human reviewer. An external-provider failure leaves the claim unverified and does not block the regular analysis.
+
+Existing source records are migrated additively and marked pending; re-approve only after checking their provenance. Previously saved analyses remain historical snapshots and are not recalculated by this migration. Re-run any pre-migration analysis before relying on its claim status.
 
 ### Authentication and roles
 
@@ -57,8 +70,8 @@ Factual verification compares detected numeric and promotional claims with admin
 - `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`, and `POST /api/auth/password` handle session and password operations.
 - Admins can list members, invite accounts, resend pending invitations, and update account roles/status at `/api/auth/users`. Invitation creation and resend require SMTP configuration. Invited accounts remain inactive until a recipient accepts the 48-hour single-use link and sets a password of at least 12 characters; the database stores only the token digest. Invitation links and passwords are never returned by the API or written to application audit records/logs. Account creation, resend, acceptance, and updates create account audit events.
 - `POST /api/auth/invitations/accept` accepts `{"token":"...","new_password":"..."}` and activates the account with the role selected by the Admin. Public self-registration is not implemented.
-- **Admin** can manage users, guidelines and approved sources, analyze content, and manage reviews.
-- **Reviewer** can read guidelines/sources, analyze content, and manage review status, comments, and revisions.
+- **Admin** can manage users, guidelines and evidence sources, approve/reject evidence, analyze content, and manage reviews.
+- **Reviewer** can read guidelines/sources, approve/reject evidence, analyze content, and manage review status, comments, and revisions.
 - **Contributor** can read workspace materials, submit analyses, and add comments/revisions; only Admins and Reviewers can decide review status.
 - Review author/reviewer names are taken from the signed-in account, not trusted from client-supplied identity fields.
 - Authenticated state-changing requests validate their `Origin`; WebSocket collaboration validates both session and origin. Use the same host name for frontend and API in local development, as configured by `CORS_ORIGINS`.
@@ -79,10 +92,11 @@ All endpoints are under `/api`; FastAPI provides interactive schemas at `/docs`.
 - `GET /api/guidelines` → guideline array. Three starter rules are inserted when the database is first initialized.
 - `POST /api/guidelines` → `201` and the created guideline. Required: `name`, `category`, `description`; optional: `severity`, `prohibited_terms`, `preferred_terms`, `approved_sources`.
 - `DELETE /api/guidelines/{guideline_id}` → `204`; `404` if not found.
-- `GET /api/sources` → approved source text records.
-- `POST /api/sources` → `201` approved source text with optional guideline, URL, source date and expiry date.
-- `POST /api/sources/upload` → `201`; extracts UTF-8 TXT/Markdown or text-bearing PDF to approved source text (10 MiB and 100-page defaults).
-- `DELETE /api/sources/{source_id}` → `204`.
+- `GET /api/sources` → evidence records and their approval status/history.
+- `POST /api/sources` → `201` pending evidence text with optional guideline, URL, source date and expiry date.
+- `POST /api/sources/upload` → `201`; extracts UTF-8 TXT/Markdown or text-bearing PDF to pending evidence (10 MiB and 100-page defaults).
+- Admin/Reviewer `PATCH /api/sources/{source_id}/approval` accepts `{"status":"approved"|"rejected","note":"optional reviewer context"}` and records the decision. Only approved sources are available to analysis.
+- Admin-only `DELETE /api/sources/{source_id}` → `204`.
 
 Example create body:
 
@@ -119,7 +133,7 @@ Factual and promotional claim findings include `claim`, `verification_status` (`
 
 The `200` response has a persisted review `id`/`review_id`, `overall_status`, `total_issues`, grouped `summary`, `findings` (also available as `issues`), `analyzed_at`, and optional `image_analysis`. Findings include `category`, `severity`, `title`, `explanation`/`message`, `matched_text`, `suggestion`, `source`/`guideline`, confidence, and pending review status. No-issue analyses are still recorded for human workflow.
 
-The deterministic rules identify configured prohibited terms, selected promotional-claim heuristics, simple factual-looking excerpts, and basic accessibility signals. Source retrieval reports candidate excerpts, source dates, expiry dates, and relevance. Without `EMBEDDING_MODEL`, retrieval uses local BM25 lexical ranking. With it, source text is chunked and vectors are cached in SQLite/SQLAlchemy storage; each analysis embeds the factual excerpt and ranks cached chunks by cosine similarity. The analysis response and health endpoint identify the retrieval mode. Candidate matches are never treated as proof or marked verified. Embedding provider errors return `502` instead of silently falling back to lexical ranking. If the LLM is explicitly configured, validated structured advisory findings are added to the local rules output; provider failures return `502`.
+The deterministic rules identify configured prohibited terms, selected promotional-claim heuristics, simple factual-looking excerpts, and basic accessibility signals. Source retrieval reports candidate excerpts, source dates, expiry dates, and relevance. Without `EMBEDDING_MODEL`, retrieval uses local BM25 lexical ranking. With it, source text is chunked and vectors are cached in SQLite/SQLAlchemy storage; each analysis embeds the factual excerpt and ranks cached chunks by cosine similarity. If embedding retrieval fails, analysis falls back to local BM25 retrieval and returns the failure in `provider_warnings`. If the LLM is explicitly configured, validated structured advisory findings are added to the local rules output; an LLM failure is also reported in `provider_warnings` while deterministic analysis continues. A successful response identifies the analysis and evidence retrieval modes. Candidate matches are never treated as proof or marked verified.
 
 Example semantic retrieval configuration (without enabling LLM analysis):
 
@@ -136,11 +150,12 @@ Image analysis validates format, size, dimensions, and image integrity; reports 
 ### Review workflow
 
 - `GET /api/reviews?offset=0&limit=20&status=pending` → paginated `{items,total,offset,limit}`.
-- `GET /api/reviews/{review_id}` → review with findings, comments, revisions.
+- `GET /api/reviews/{review_id}` → review with findings, comments, revisions, and analysis-run snapshots.
 - `GET /api/reviews/{review_id}/activity` → append-only application events for analysis, comments, revisions, and status changes.
 - `PATCH /api/reviews/{review_id}/status` with `{"status":"in_review","reviewer":"Reviewer Name"}` → updated review; status audit event is persisted.
 - `POST /api/reviews/{review_id}/comments` with `{"comment":"Please verify the source.","author":"Reviewer Name"}` → `201` comment.
-- `POST /api/reviews/{review_id}/revisions` with `{"content":"Updated draft","title":"Revision 1"}` → `201` revision.
+- `POST /api/reviews/{review_id}/revisions` with `{"content":"Updated draft","title":"Revision 1"}` → `201` revision without re-analysis; retained for API compatibility.
+- `POST /api/reviews/{review_id}/reanalyze` with `{"content":"Updated draft","title":"Revision 1"}` → persists a revision, reruns deterministic rules against approved local evidence, stores a new analysis snapshot, and resets review status to `pending`. Optional LLM and external-search providers are not called.
 
 Supported statuses are `pending`, `in_review`, `approved`, and `changes_requested`. Status changes require an authenticated Admin or Reviewer; the recorded reviewer identity comes from the active session.
 

@@ -11,7 +11,7 @@ Responsive React/Vite workspace for brand-guideline content review, human approv
 
 ```bash
 cd frontend
-npm install
+npm ci
 cp .env.example .env
 npm run dev
 ```
@@ -38,13 +38,15 @@ Requests are centralized in `src/services/api.js` and use the documented endpoin
 - `PATCH /api/reviews/{review_id}/status`
 - `POST /api/reviews/{review_id}/comments`
 - `POST /api/reviews/{review_id}/revisions`
+- `POST /api/reviews/{review_id}/reanalyze`
 - `GET/POST/DELETE /api/sources`
 - `GET /api/reviews/{review_id}/activity`
 - `WS /api/reviews/{review_id}/collaboration`
+- `PATCH /api/sources/{source_id}/approval` (Admin/Reviewer)
 - `GET /api/analytics/summary`
 - `GET /api/analytics/guideline-blind-spots`
 
-Analysis supports selecting approved evidence sources and adding alternative text for an uploaded PNG, JPG, or WEBP. Factual and promotional claims show a verification status, explanation, confidence, suggested correction, and real citations when available. Results are advisory; lack of evidence is not proof a claim is false, and human approval remains required. Optional Brave Search is disabled unless configured on the backend and explicitly selected per analysis. When selected, only extracted claim excerpts are sent to Brave Search; the full draft and image are not sent by that factual lookup. Results are restricted to configured trusted domains. TXT, Markdown, and text-bearing PDF references can be uploaded from the Evidence Sources page.
+Analysis supports selecting evidence sources approved by an Admin or Reviewer and adding alternative text for an uploaded PNG, JPG, or WEBP. New and migrated legacy sources begin pending; pending or rejected material is excluded from analysis. Approval decisions record reviewer, time, note, and decision history. Factual and promotional claims show a verification status, explanation, confidence, suggested correction, and real citations when available. Results are advisory; lack of evidence is not proof a claim is false, and human approval remains required. Optional Brave Search is disabled unless configured on the backend and explicitly selected per analysis. When selected, only extracted claim excerpts are sent to Brave Search; the full draft and image are not sent by that factual lookup. Results are restricted to configured trusted domains. TXT, Markdown, and text-bearing PDF references can be uploaded from the Evidence Sources page.
 
 ## Known limitations
 
@@ -53,6 +55,7 @@ Analysis supports selecting approved evidence sources and adding alternative tex
 - OCR requires the backend `OCR_ENABLED=true` setting and an installed Tesseract executable.
 - Real-time presence and updates use WebSockets and are limited to a single backend process.
 - Shared draft edits are ephemeral until an explicit revision save.
+- Saving a revision reruns deterministic checks against approved local evidence. The review detail shows the saved analysis-run history; optional LLM and external-search providers are not used for re-analysis.
 - Brand palette comparison requires configured backend hex colours and uses an approximate RGB heuristic.
 - Optional LLM analysis requires explicit backend provider configuration; submitted content and guideline context are sent to that configured service.
 - PDF upload is supported for approved evidence sources only; direct PDF content review, DOCX, Figma, and other design integrations are not implemented.
@@ -60,6 +63,14 @@ Analysis supports selecting approved evidence sources and adding alternative tex
 - Email recovery is available only when the backend reports SMTP configured. The backend sends a single-use link that expires after 20 minutes, stores only its token hash, and revokes existing sessions after reset. Recovery requests are rate-limited and have generic responses to avoid account enumeration. Configure SMTP and `PASSWORD_RESET_BASE_URL` on the backend; the mail provider receives the recipient address and recovery message.
 - User invitations use the same configured SMTP transport and send only an expiring link; invitation tokens are stored as digests and are never returned by the API. Resending invalidates earlier pending links. An email provider receives the recipient address and invitation message.
 - The application does not invent live statistics: unavailable API values are shown as empty states or em dashes.
+
+## Local utility tests
+
+The suggestion-application helper has dependency-free unit tests:
+
+```bash
+npm run test:utils
+```
 
 ## Production build
 

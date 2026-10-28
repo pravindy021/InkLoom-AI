@@ -46,6 +46,7 @@ const realApi = {
   deleteGuideline: (id) => request(`/api/guidelines/${encodeURIComponent(id)}`, { method: "DELETE" }),
   sources: () => request("/api/sources"),
   createSource: (data) => request("/api/sources", json("POST", data)),
+  reviewSource: (id, status, note) => request(`/api/sources/${encodeURIComponent(id)}/approval`, json("PATCH", { status, note })),
   uploadSource: (data) => {
     const form = new FormData();
     form.append("file", data.file);
@@ -77,6 +78,7 @@ const realApi = {
   updateStatus: (id, status) => request(`/api/reviews/${encodeURIComponent(id)}/status`, json("PATCH", { status })),
   addComment: (id, comment) => request(`/api/reviews/${encodeURIComponent(id)}/comments`, json("POST", { comment })),
   addRevision: (id, revision) => request(`/api/reviews/${encodeURIComponent(id)}/revisions`, json("POST", revision)),
+  reanalyze: (id, revision) => request(`/api/reviews/${encodeURIComponent(id)}/reanalyze`, json("POST", revision)),
   analytics: () => request("/api/analytics/summary"),
   blindSpots: () => request("/api/analytics/guideline-blind-spots"),
 };

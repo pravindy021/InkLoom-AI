@@ -59,3 +59,37 @@ def test_current_retrieved_source_is_not_reported_as_missing():
     factual = next(item for item in findings if item["category"] == "factual_claim")
     assert "current approved source excerpt matched" in factual["explanation"]
     assert "not verification" in factual["explanation"]
+
+
+def test_quoted_promotional_claim_excludes_closing_quote():
+    from app.services.claim_checker import check_promotional_claims
+
+    text = (
+        "Our product is "
+        "“100% guaranteed to double your productivity in just 24 hours”."
+    )
+
+    findings = check_promotional_claims(text)
+    finding = next(
+        item for item in findings
+        if item["category"] == "unsupported_claim"
+    )
+
+    assert finding["matched_text"].endswith("24 hours")
+    assert not finding["matched_text"].endswith("”")
+
+
+def test_claim_suggestion_does_not_contaminate_matched_text():
+    findings = analyze_text(
+        "Our product is 100% guaranteed to double your productivity in just 24 hours.",
+        [],
+    )
+
+    finding = next(
+        item for item in findings
+        if item["category"] == "unsupported_claim"
+    )
+
+    assert finding["matched_text"].endswith("24 hours")
+    assert "Revise" not in finding["matched_text"]
+    assert "Revise" in finding["suggestion"]

@@ -65,15 +65,26 @@ export const mockApi = {
   },
   sources: () => wait(sources),
   createSource: async (data) => {
-    const source = { ...data, id: `source-${Date.now()}`, created_at: new Date().toISOString() };
+    const source = { ...data, id: `source-${Date.now()}`, approval_status: "pending", created_at: new Date().toISOString() };
     sources.unshift(source);
+    return wait(source);
+  },
+  reviewSource: async (id, status, note) => {
+    const source = sources.find((item) => String(item.id) === String(id));
+    if (!source) throw new Error("Evidence source not found.");
+    Object.assign(source, {
+      approval_status: status,
+      reviewed_by: "Mock workspace",
+      reviewed_at: new Date().toISOString(),
+      review_note: note || null,
+    });
     return wait(source);
   },
   uploadSource: async ({ file, ...data }) => {
     if (!file || !/\.(txt|md)$/i.test(file.name)) {
       throw new Error("Mock mode supports TXT and Markdown source uploads only.");
     }
-    const source = { ...data, name: data.name || file.name, content: await file.text(), id: `source-${Date.now()}`, created_at: new Date().toISOString() };
+    const source = { ...data, name: data.name || file.name, content: await file.text(), id: `source-${Date.now()}`, approval_status: "pending", created_at: new Date().toISOString() };
     sources.unshift(source);
     return wait(source);
   },
@@ -106,6 +117,14 @@ export const mockApi = {
       comments: [],
       _source: "mock",
     };
+    review.analysis_runs = [{
+      id: `run-${Date.now()}`,
+      content,
+      findings: review.findings,
+      analysis_engine: "mock",
+      warnings: [],
+      created_at: review.submitted_at,
+    }];
     reviews.unshift(review);
     return wait(review);
   },
@@ -130,6 +149,51 @@ export const mockApi = {
     item.revisions = [...(item.revisions || []), entry];
     if (revision.content) item.content = revision.content;
     return wait(entry);
+  },
+  reanalyze: async (id, revision) => {
+    const item = reviews.find((review) => String(review.id) === String(id));
+    if (!item) throw new Error("Review not found");
+    if (revision.content === item.content) throw new Error("The revision must differ from the current review content.");
+    item.analysis_runs = item.analysis_runs || [{
+      id: `run-${Date.now()}`,
+      content: item.content,
+      findings: item.findings || [],
+      analysis_engine: "mock",
+      warnings: [],
+      created_at: new Date().toISOString(),
+    }];
+    const matched = revision.content.match(/\b(ultimate|guaranteed|best)\b/i)?.[0];
+    const findings = matched ? [{
+      id: `finding-${Date.now()}`,
+      category: "Claims",
+      severity: "medium",
+      title: "Illustrative mock finding",
+      explanation: "This mock result is for interface development only.",
+      matched_text: matched,
+      suggestion: "Review this wording against your approved brand voice.",
+      status: "pending",
+    }] : [];
+    item.revisions = item.revisions || [];
+    item.revisions.push({
+      id: `rev-${Date.now()}`,
+      content: revision.content,
+      title: revision.title || "Revision with re-analysis",
+      created_at: new Date().toISOString(),
+    });
+    item.content = revision.content;
+    item.findings = findings;
+    item.issue_count = findings.length;
+    item.status = "pending";
+    item.reviewer = null;
+    item.analysis_runs.push({
+      id: `run-${Date.now()}`,
+      content: revision.content,
+      findings,
+      analysis_engine: "mock",
+      warnings: [],
+      created_at: new Date().toISOString(),
+    });
+    return wait(item);
   },
   reviewActivity: () => wait([]),
   analytics: () => wait({

@@ -5,13 +5,31 @@ from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSock
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
-from app.models.content_review import ContentReview, ReviewRevision
+from app.models.brand_guideline import BrandGuideline
+from app.models.content_review import (
+    ContentReview,
+    ReviewAnalysisRun,
+    ReviewFinding,
+    ReviewRevision,
+)
 from app.models.review_comment import ReviewActivity, ReviewComment
+from app.models.source_document import SourceDocument
 from app.schemas.reviews import CommentCreate, RevisionCreate, StatusUpdate
 from app.services.audit_service import record_status_change
 from app.services.activity_service import record_activity
 from app.services.collaboration import collaboration_hub
 from app.services.review_service import review_payload
+from app.services.claim_checker import check_promotional_claims, factual_claim_excerpts
+from app.services.factual_verifier import verification_fields
+from app.services.source_retrieval import (
+    EmbeddingProviderError,
+    retrieve_evidence,
+    retrieve_lexical_evidence,
+    retrieval_method,
+)
+from app.services.text_analyzer import analyze_text
+from app.config import MAX_CONTENT_LENGTH
+from datetime import datetime, timezone
 from app.models.user import User
 from app.services.auth_service import authenticate_token, require_roles
 from app.config import CORS_ORIGINS
@@ -29,6 +47,7 @@ def _get_review(db: Session, review_id: int) -> ContentReview:
             selectinload(ContentReview.findings),
             selectinload(ContentReview.comments),
             selectinload(ContentReview.revisions),
+            selectinload(ContentReview.analysis_runs),
         )
         .filter(ContentReview.id == review_id)
         .first()
@@ -212,6 +231,220 @@ async def add_revision(
         review_id, {"type": "revision_created", "payload": result}
     )
     return result
+
+
+@router.post("/{review_id}/reanalyze")
+async def reanalyze_revision(
+    review_id: int,
+    payload: RevisionCreate,
+    db: Session = Depends(get_db),
+    author: User = Depends(require_roles("admin", "reviewer", "contributor")),
+):
+    if len(payload.content.encode("utf-8")) > MAX_CONTENT_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail="Content exceeds the configured maximum length.",
+        )
+    review = _get_review(db, review_id)
+    if payload.content == review.content:
+        raise HTTPException(
+            status_code=422,
+            detail="The revision must differ from the current review content.",
+        )
+
+    guideline_ids = review.guideline_ids or []
+    guidelines = (
+        db.query(BrandGuideline)
+        .filter(BrandGuideline.id.in_(guideline_ids))
+        .all()
+        if guideline_ids
+        else []
+    )
+    sources_query = db.query(SourceDocument).filter(
+        SourceDocument.approval_status == "approved"
+    )
+    if guideline_ids:
+        sources_query = sources_query.filter(
+            (SourceDocument.guideline_id.is_(None))
+            | (SourceDocument.guideline_id.in_(guideline_ids))
+        )
+    sources = sources_query.all()
+
+    claim_candidates = list(
+        dict.fromkeys(
+            factual_claim_excerpts(payload.content)
+            + [
+                str(finding["matched_text"])
+                for finding in check_promotional_claims(payload.content)
+                if finding.get("matched_text")
+            ]
+        )
+    )
+    evidence_by_claim = {}
+    evidence_matches = []
+    evidence_retrieval_method = retrieval_method()
+    warnings = []
+    embedding_failed = False
+    for claim in claim_candidates[:20]:
+        if embedding_failed:
+            matches = retrieve_lexical_evidence(claim, sources)
+            evidence_retrieval_method = "bm25_lexical_fallback"
+        else:
+            try:
+                matches, evidence_retrieval_method = await retrieve_evidence(
+                    claim, sources, db
+                )
+            except EmbeddingProviderError as exc:
+                embedding_failed = True
+                matches = retrieve_lexical_evidence(claim, sources)
+                evidence_retrieval_method = "bm25_lexical_fallback"
+                warnings.append(
+                    "Embedding retrieval failed; lexical evidence retrieval was used. {}".format(
+                        str(exc)
+                    )
+                )
+        evidence_by_claim[claim.casefold()] = matches
+        for match in matches:
+            if not any(
+                item.get("id") == match.get("id")
+                and item.get("excerpt") == match.get("excerpt")
+                for item in evidence_matches
+            ):
+                evidence_matches.append(match)
+
+    findings = analyze_text(
+        payload.content,
+        guidelines,
+        evidence_matches=evidence_matches,
+        evidence_by_claim=evidence_by_claim,
+    )
+    for finding in findings:
+        if finding.get("category") not in {"factual_claim", "unsupported_claim"}:
+            continue
+        claim = str(finding.get("matched_text") or "").strip()
+        claim_evidence = evidence_by_claim.get(claim.casefold(), [])
+        if not claim_evidence:
+            candidate = next(
+                (
+                    item
+                    for item in claim_candidates
+                    if claim
+                    and (
+                        claim.casefold() in item.casefold()
+                        or item.casefold() in claim.casefold()
+                    )
+                ),
+                None,
+            )
+            if candidate:
+                claim_evidence = evidence_by_claim.get(candidate.casefold(), [])
+        verified = verification_fields(claim, claim_evidence)
+        finding.update(verified)
+        finding["confidence"] = verified["verification_confidence"]
+        finding["explanation"] = "{} {}".format(
+            finding["explanation"], verified["verification_explanation"]
+        )
+
+    if not review.analysis_runs:
+        previous_findings = [finding_payload(item) for item in review.findings]
+        db.add(
+            ReviewAnalysisRun(
+                review_id=review.id,
+                content=review.content,
+                findings=previous_findings,
+                analysis_engine="historical",
+                evidence_retrieval_method=None,
+                warnings=[],
+                created_by_id=None,
+            )
+        )
+
+    revision = ReviewRevision(
+        review_id=review.id,
+        content=payload.content,
+        title=payload.title or "Revision with re-analysis",
+    )
+    db.add(revision)
+    db.flush()
+    review.content = payload.content
+    review.analysis_timestamp = datetime.now(timezone.utc)
+    review.status = "pending"
+    review.reviewer = None
+    for old_finding in list(review.findings):
+        db.delete(old_finding)
+    db.flush()
+
+    new_findings = []
+    for item in findings:
+        model = ReviewFinding(
+            review_id=review.id,
+            guideline_id=item.get("guideline_id"),
+            category=item["category"],
+            severity=item["severity"],
+            title=item["title"],
+            explanation=item["explanation"],
+            matched_text=item.get("matched_text"),
+            suggestion=item.get("suggestion"),
+            source=item.get("source"),
+            confidence=item.get("confidence"),
+            review_status="pending",
+            metadata_json={
+                key: item[key]
+                for key in (
+                    "claim",
+                    "verification_status",
+                    "citations",
+                    "verification_explanation",
+                    "verification_confidence",
+                )
+                if key in item
+            },
+        )
+        db.add(model)
+        new_findings.append(model)
+    db.flush()
+
+    finding_snapshots = [finding_payload(item) for item in new_findings]
+    db.add(
+        ReviewAnalysisRun(
+            review_id=review.id,
+            content=payload.content,
+            findings=finding_snapshots,
+            analysis_engine="rules",
+            evidence_retrieval_method=evidence_retrieval_method,
+            warnings=warnings,
+            created_by_id=author.id,
+        )
+    )
+    record_activity(
+        db,
+        review.id,
+        "revision_reanalyzed",
+        actor=author.display_name,
+        details={
+            "revision_id": revision.id,
+            "issue_count": len(findings),
+            "analysis_engine": "rules",
+            "evidence_retrieval_method": evidence_retrieval_method,
+            "warnings": warnings,
+        },
+    )
+    db.commit()
+    await collaboration_hub.broadcast(
+        review_id,
+        {
+            "type": "revision_created",
+            "payload": {
+                "id": revision.id,
+                "content": revision.content,
+                "title": revision.title,
+                "summary": revision.title,
+                "created_at": revision.created_at,
+            },
+        },
+    )
+    serialized = review_payload(_get_review(db, review_id))
+    return serialized
 
 
 @router.websocket("/{review_id}/collaboration")

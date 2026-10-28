@@ -1,8 +1,21 @@
 from datetime import date, datetime
-from typing import Optional
+from typing import List, Literal, Optional
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class SourceApprovalUpdate(BaseModel):
+    status: Literal["approved", "rejected"]
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+    @field_validator("note")
+    @classmethod
+    def trim_note(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
 
 class SourceCreate(BaseModel):
@@ -38,6 +51,13 @@ class SourceCreate(BaseModel):
         return self
 
 
+class SourceApprovalHistoryRead(BaseModel):
+    status: Literal["approved", "rejected"]
+    reviewer: Optional[str]
+    note: Optional[str]
+    created_at: datetime
+
+
 class SourceRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -48,4 +68,10 @@ class SourceRead(BaseModel):
     url: Optional[str]
     source_date: Optional[date]
     expiry_date: Optional[date]
+    approval_status: Literal["pending", "approved", "rejected"]
+    reviewed_by_id: Optional[int]
+    reviewed_by: Optional[str]
+    reviewed_at: Optional[datetime]
+    review_note: Optional[str]
+    approval_history: List[SourceApprovalHistoryRead] = Field(default_factory=list)
     created_at: datetime

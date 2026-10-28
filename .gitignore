@@ -1,0 +1,29 @@
+# Local secrets and environment configuration
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python local environments and caches
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+
+# Local databases and generated application data
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+
+# Frontend dependencies and generated builds
+frontend/node_modules/
+frontend/dist/
+
+# Local editor / OS files
+.DS_Store
+.vscode/*.log
+
+# Local backup copies; keep these out of version control
+*.bak
+*.before_button_fix
+app_backup_*.py

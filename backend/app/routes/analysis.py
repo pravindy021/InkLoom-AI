@@ -18,7 +18,7 @@ from app.config import (
 )
 from app.database import get_db
 from app.models.brand_guideline import BrandGuideline
-from app.models.content_review import ContentReview, ReviewFinding
+from app.models.content_review import ContentReview, ReviewAnalysisRun, ReviewFinding
 from app.models.source_document import SourceDocument
 from app.models.user import User
 from app.schemas.analysis import AnalysisRequest
@@ -38,6 +38,7 @@ from app.services.factual_verifier import (
 from app.services.source_retrieval import (
     EmbeddingProviderError,
     retrieve_evidence,
+    retrieve_lexical_evidence,
     retrieval_method,
 )
 from app.services.llm_analyzer import LLMProviderError, analyze_with_llm, llm_enabled
@@ -159,7 +160,9 @@ async def analyze_content(
     else:
         guidelines = db.query(BrandGuideline).all()
 
-    source_query = db.query(SourceDocument)
+    source_query = db.query(SourceDocument).filter(
+        SourceDocument.approval_status == "approved"
+    )
     if payload.source_ids:
         source_query = source_query.filter(SourceDocument.id.in_(payload.source_ids))
     elif payload.guideline_ids:
@@ -174,7 +177,10 @@ async def analyze_content(
         if missing_source_ids:
             raise HTTPException(
                 status_code=422,
-                detail="Unknown source id(s): {}.".format(", ".join(map(str, missing_source_ids))),
+                detail=(
+                    "Unknown or unapproved source id(s): {}."
+                    .format(", ".join(map(str, missing_source_ids)))
+                ),
             )
     claim_candidates = factual_claim_excerpts(payload.content) + [
         str(item["matched_text"])
@@ -185,6 +191,8 @@ async def analyze_content(
     evidence_by_claim = {}
     evidence_matches = []
     evidence_retrieval_method = retrieval_method()
+    embedding_provider_failed = False
+    provider_warnings = []
     external_failure = False
     external_claims_searched = 0
     external_claims_attempted = 0
@@ -194,13 +202,23 @@ async def analyze_content(
         else 0
     )
     for index, claim in enumerate(claim_candidates[:MAX_LOCAL_CLAIMS]):
-        try:
-            local_matches, evidence_retrieval_method = await retrieve_evidence(
-                claim, sources, db
-            )
-        except EmbeddingProviderError as exc:
-            db.rollback()
-            raise HTTPException(status_code=502, detail=str(exc))
+        if embedding_provider_failed:
+            local_matches = retrieve_lexical_evidence(claim, sources)
+            evidence_retrieval_method = "bm25_lexical_fallback"
+        else:
+            try:
+                local_matches, evidence_retrieval_method = await retrieve_evidence(
+                    claim, sources, db
+                )
+            except EmbeddingProviderError as exc:
+                embedding_provider_failed = True
+                provider_warnings.append(
+                    "Embedding retrieval failed; lexical evidence retrieval was used. {}".format(
+                        str(exc)
+                    )
+                )
+                local_matches = retrieve_lexical_evidence(claim, sources)
+                evidence_retrieval_method = "bm25_lexical_fallback"
         claim_evidence = list(local_matches)
         if (
             payload.allow_external_verification
@@ -259,24 +277,28 @@ async def analyze_content(
         try:
             llm_findings = await analyze_with_llm(payload.content, guidelines, evidence_matches)
         except LLMProviderError as exc:
-            db.rollback()
-            raise HTTPException(status_code=502, detail=str(exc))
-        known = {
-            (
-                str(item.get("category", "")).casefold(),
-                str(item.get("matched_text") or "").casefold(),
+            provider_warnings.append(
+                "Configured LLM analysis failed; deterministic findings are still available. {}".format(
+                    str(exc)
+                )
             )
-            for item in findings
-        }
-        for item in llm_findings:
-            key = (
-                str(item.get("category", "")).casefold(),
-                str(item.get("matched_text") or "").casefold(),
-            )
-            if key not in known:
-                findings.append(item)
-                known.add(key)
-        analysis_engine = "rules+configured_llm"
+        else:
+            known = {
+                (
+                    str(item.get("category", "")).casefold(),
+                    str(item.get("matched_text") or "").casefold(),
+                )
+                for item in findings
+            }
+            for item in llm_findings:
+                key = (
+                    str(item.get("category", "")).casefold(),
+                    str(item.get("matched_text") or "").casefold(),
+                )
+                if key not in known:
+                    findings.append(item)
+                    known.add(key)
+            analysis_engine = "rules+configured_llm"
     for finding in findings:
         if finding.get("category") not in {"factual_claim", "unsupported_claim"}:
             continue
@@ -396,6 +418,18 @@ async def analyze_content(
         )
         db.add(model)
         finding_models.append(model)
+    db.flush()
+    db.add(
+        ReviewAnalysisRun(
+            review_id=review.id,
+            content=payload.content,
+            findings=[finding_payload(item) for item in finding_models],
+            analysis_engine=analysis_engine,
+            evidence_retrieval_method=evidence_retrieval_method,
+            warnings=provider_warnings,
+            created_by_id=analyst.id,
+        )
+    )
     db.commit()
     db.refresh(review)
     for finding in finding_models:
@@ -429,6 +463,7 @@ async def analyze_content(
         "issues": [finding_payload(item) for item in finding_models],
         "retrieved_evidence": evidence_matches,
         "evidence_retrieval_method": evidence_retrieval_method,
+        "provider_warnings": provider_warnings,
         "factual_verification": "claim_level_verification_advisory",
         "external_verification": {
             "requested": payload.allow_external_verification,

@@ -237,6 +237,14 @@ def _lexical_retrieval(
     )[:limit]
 
 
+def retrieve_lexical_evidence(
+    query: str,
+    sources: Sequence[SourceDocument],
+    limit: int = 5,
+) -> List[Dict[str, object]]:
+    return _lexical_retrieval(query, sources, limit)
+
+
 async def _semantic_retrieval(
     query: str,
     sources: Sequence[SourceDocument],

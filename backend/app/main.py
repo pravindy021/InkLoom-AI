@@ -7,7 +7,7 @@ from sqlalchemy import Engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import API_VERSION, CORS_ORIGINS
-from app.database import Base, engine, get_db
+from app.database import Base, engine, get_db, migrate_source_approval
 from app.models import BrandGuideline
 from app.routes import analytics, analysis, auth, guidelines, health, reviews, sources
 from app.services.auth_service import bootstrap_admin
@@ -54,6 +54,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         Base.metadata.create_all(bind=database_engine)
+        migrate_source_approval(database_engine)
         db = local_sessions()
         try:
             if db.query(BrandGuideline).count() == 0:

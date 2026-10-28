@@ -85,7 +85,7 @@ def check_promotional_claims(text: str) -> List[Dict[str, object]]:
                     "severity": "high",
                     "title": title,
                     "explanation": explanation,
-                    "matched_text": match.group(0).strip(),
+                    "matched_text": match.group(0).strip().rstrip(" \t\r\n\"'“”‘’"),
                     "suggestion": (
                         "Revise the claim to match verified product information and "
                         "retain evidence for any performance promise."

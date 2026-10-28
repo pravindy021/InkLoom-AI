@@ -23,6 +23,10 @@ def _integer_setting(name: str, default: int, minimum: int) -> int:
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./inkloom.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(

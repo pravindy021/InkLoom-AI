@@ -127,9 +127,14 @@ def classify_claim(
     if not claim_words:
         return "unverified", 0.2, []
 
+    local_evidence = [
+        source
+        for source in evidence
+        if source.get("source_type") != "external_trusted_source"
+    ]
     supported = []
     contradicted = []
-    for source in evidence:
+    for source in local_evidence:
         if source.get("freshness") == "expired":
             continue
         excerpt = str(source.get("excerpt") or "")
@@ -146,6 +151,12 @@ def classify_claim(
                     contradicted.append(source)
             elif overlap == 1 and not claim_numbers:
                 supported.append(source)
+    # Do not let one matching source hide another source that gives a
+    # conflicting value. Surface both sides so a reviewer can resolve scope,
+    # date, or source-authority differences before publication.
+    if supported and contradicted:
+        citations = (supported[:2] + contradicted[:2])[:4]
+        return "conflicting_evidence", 0.55, citations
     if supported:
         return "verified", 0.9, supported[:3]
     if contradicted:
@@ -162,6 +173,7 @@ def verification_fields(
         "verified": "A configured source contains matching claim details. Confirm scope, date, and context before publication.",
         "contradicted": "A configured source contains a conflicting value for this claim. Check that the source is current and applies to the same scope.",
         "unverified": "No sufficiently clear supporting or conflicting statement was found. Lack of evidence is not proof that this claim is false.",
+        "conflicting_evidence": "Approved evidence contains both matching and conflicting values. Review source dates, scope, and authority before publication.",
     }
     return {
         "claim": claim,

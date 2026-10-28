@@ -4,6 +4,27 @@ import { Link, useParams } from "react-router-dom";
 import { API_BASE_URL, api, errorMessage, unwrapList } from "../services/api";
 import { Badge, EmptyState, ErrorMessage, ErrorState, LoadingState, PageHeader, SuccessMessage } from "../components/common/UI";
 import { useAuth } from "../contexts/AuthContext";
+import { applySuggestionToContent, getSafeReplacement } from "../utils/applySuggestion";
+
+function changedParts(before, after) {
+  let start = 0;
+  while (start < before.length && start < after.length && before[start] === after[start]) {
+    start += 1;
+  }
+  while (start > 0 && start < before.length && !/\s/.test(before[start - 1])) start -= 1;
+  let beforeEnd = before.length;
+  let afterEnd = after.length;
+  while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+    beforeEnd -= 1;
+    afterEnd -= 1;
+  }
+  return {
+    prefix: before.slice(0, start),
+    removed: before.slice(start, beforeEnd),
+    added: after.slice(start, afterEnd),
+    suffix: before.slice(beforeEnd),
+  };
+}
 
 export default function ReviewDetailPage() {
   const { user } = useAuth();
@@ -98,15 +119,55 @@ export default function ReviewDetailPage() {
     if (!draftContent.trim()) return;
     setBusy(true); setActionError(""); setNotice("");
     try {
-      await api.addRevision(reviewId, { content: draftContent.trim() });
-      setNotice("Revision saved.");
+      const response = await api.reanalyze(reviewId, {
+        content: draftContent.trim(),
+        title: `Revision ${revisions.length + 1}`,
+      });
+      setItem(response?.data || response);
+      setDraftContent((response?.data || response)?.content || draftContent.trim());
+      setNotice("Revision saved and deterministic checks rerun. Human review is required again.");
       await load();
     } catch (e) { setActionError(errorMessage(e)); }
     finally { setBusy(false); }
   };
+  const applySuggestion = (finding) => {
+  const matched = finding.matched_text;
+  const suggestion = finding.suggestion;
+  const category = finding.category || finding.type;
+
+  if (!matched || !suggestion) {
+    setActionError("This finding does not contain usable text and guidance.");
+    return;
+  }
+
+  const safe = getSafeReplacement(String(matched), String(suggestion), category);
+  if (!safe.ok) {
+    setActionError("This suggestion is guidance, not ready-to-insert replacement text. Edit the draft manually.");
+    return;
+  }
+
+  const result = applySuggestionToContent(draftContent, String(matched), safe.replacement);
+  if (!result.ok) {
+    const messages = {
+      "not-found": "The flagged text is not present in the current draft. Edit manually.",
+      ambiguous: `“${matched}” appears more than once. Edit the intended occurrence manually.`,
+      "missing-text": "The finding does not contain usable replacement text.",
+      "invalid-input": "This suggestion cannot be applied automatically.",
+    };
+    setActionError(messages[result.reason] || "This suggestion cannot be applied automatically.");
+    return;
+  }
+
+  updateDraft(result.content);
+  setNotice("Approved terminology replacement applied. Review and save the draft before rerunning checks.");
+};
   const findings = unwrapList(item?.findings || item?.issues);
   const comments = unwrapList(item?.comments);
   const revisions = unwrapList(item?.revisions);
+  const analysisRuns = unwrapList(item?.analysis_runs);
+  const comparison = draftContent !== item?.content
+    ? changedParts(item?.content || "", draftContent)
+    : null;
   if (loading) return <LoadingState label="Loading review..." />;
   if (error || !item) return <><Link to="/reviews" className="mb-5 inline-flex items-center gap-2 text-sm text-slate-500 hover:text-ink-700"><ArrowLeft size={16} />Review queue</Link><ErrorState message={error || "Review not found."} onRetry={load} /></>;
   return <>
@@ -116,10 +177,11 @@ export default function ReviewDetailPage() {
     {notice && <div className="mb-4"><SuccessMessage>{notice}</SuccessMessage></div>}{actionError && <div className="mb-4"><ErrorMessage>{actionError}</ErrorMessage></div>}
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(350px,.8fr)]">
       <div className="space-y-5">
-        <section className="card p-5"><div className="flex items-center justify-between gap-3"><h2 className="font-semibold text-ink-900">Collaborative editing canvas</h2><span className={`text-xs ${liveState === "connected" ? "text-emerald-700" : "text-slate-400"}`}>{liveState === "connected" ? "Draft changes sync live" : "Live sync unavailable"}</span></div><p className="mt-1 text-xs leading-5 text-slate-500">Changes are shared with currently connected reviewers. Save a revision to persist edits.</p><label className="sr-only" htmlFor="shared-review-draft">Collaboratively edit content</label><textarea id="shared-review-draft" className="field mt-4 resize-y leading-7" rows={12} value={draftContent} onChange={(event) => updateDraft(event.target.value)} /><div className="mt-3 flex items-center justify-between gap-3"><span className="text-xs text-slate-400">{draftContent.length.toLocaleString()} characters · not saved until you add a revision</span><button className="btn-secondary shrink-0" type="button" onClick={saveRevision} disabled={busy || !draftContent.trim()}>Save revision</button></div></section>
-        <section className="card"><div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><div><h2 className="font-semibold text-ink-900">Flagged findings</h2><p className="mt-1 text-xs text-slate-500">{findings.length} advisory items</p></div></div>{findings.length ? <div className="divide-y divide-slate-100">{findings.map((finding, index) => <article className="p-5" key={finding.id || index}><div className="flex flex-wrap items-center gap-2"><Badge>{finding.category || finding.type || "Finding"}</Badge><Badge tone="severity">{finding.severity || "medium"}</Badge><Badge tone="status">{finding.status || "open"}</Badge>{finding.verification_status && <Badge tone={finding.verification_status === "verified" ? "approved" : finding.verification_status === "contradicted" ? "severity" : "status"}>{finding.verification_status}</Badge>}</div>{finding.matched_text && <p className="mt-3 rounded bg-rose-50 px-3 py-2 text-sm text-rose-800">“{finding.matched_text}”</p>}{finding.claim && <p className="mt-2 text-sm text-slate-700"><strong>Claim assessed: </strong>{finding.claim}</p>}<p className="mt-3 text-sm leading-6 text-slate-600">{finding.explanation || finding.description || finding.message}</p>{finding.verification_explanation && <p className="mt-2 text-xs leading-5 text-slate-500">{finding.verification_explanation}</p>}{finding.citations?.map((source, sourceIndex) => <div className="mt-3 rounded border border-slate-200 p-3" key={`${source.url || source.id || source.name}-${sourceIndex}`}><p className="text-xs font-semibold text-slate-700">{source.name || "Evidence source"}</p>{source.excerpt && <p className="mt-1 text-xs leading-5 text-slate-600">{source.excerpt}</p>}{source.url && <a className="mt-1 inline-block text-xs font-medium text-ink-700 underline" href={source.url} target="_blank" rel="noreferrer">Open citation</a>}</div>)}{finding.suggestion && <p className="mt-2 text-sm text-emerald-800"><strong>Suggestion:</strong> {finding.suggestion}</p>}<p className="mt-2 text-xs text-slate-400">Guideline: {finding.guideline || finding.source || "Not provided"}{finding.confidence != null ? ` · Confidence ${Math.round(Number(finding.confidence) * 100)}%` : ""}</p></article>)}</div> : <EmptyState title="No findings supplied" description="This review has no analysis findings to display." />}</section>
+        <section className="card p-5"><div className="flex items-center justify-between gap-3"><h2 className="font-semibold text-ink-900">Collaborative editing canvas</h2><span className={`text-xs ${liveState === "connected" ? "text-emerald-700" : "text-slate-400"}`}>{liveState === "connected" ? "Draft changes sync live" : "Live sync unavailable"}</span></div><p className="mt-1 text-xs leading-5 text-slate-500">Changes sync with connected reviewers but remain unsaved until you save and rerun checks.</p><label className="sr-only" htmlFor="shared-review-draft">Collaboratively edit content</label><textarea id="shared-review-draft" className="field mt-4 resize-y leading-7" rows={12} value={draftContent} onChange={(event) => updateDraft(event.target.value)} />{comparison && <div className="mt-4 grid gap-3 md:grid-cols-2"><div className="rounded-lg border border-slate-200 p-3"><h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Current version</h3><p className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">{comparison.prefix}<del className="rounded bg-rose-100 text-rose-900">{comparison.removed}</del>{comparison.suffix}</p></div><div className="rounded-lg border border-emerald-200 p-3"><h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-emerald-700">Proposed revision</h3><p className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">{comparison.prefix}<ins className="rounded bg-emerald-100 text-emerald-900 no-underline">{comparison.added}</ins>{comparison.suffix}</p></div></div>}<div className="mt-3 flex items-center justify-between gap-3"><span className="text-xs text-slate-400">{draftContent.length.toLocaleString()} characters · current findings refresh after re-analysis</span><button className="btn-secondary shrink-0" type="button" onClick={saveRevision} disabled={busy || !draftContent.trim() || draftContent.trim() === item.content}>{busy ? "Checking…" : "Save revision & rerun checks"}</button></div></section>
+        <section className="card"><div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><div><h2 className="font-semibold text-ink-900">Flagged findings</h2><p className="mt-1 text-xs text-slate-500">{findings.length} advisory items</p></div></div>{findings.length ? <div className="divide-y divide-slate-100">{findings.map((finding, index) => <article className="p-5" key={finding.id || index}><div className="flex flex-wrap items-center gap-2"><Badge>{finding.category || finding.type || "Finding"}</Badge><Badge tone="severity">{finding.severity || "medium"}</Badge><Badge tone="status">{finding.status || "open"}</Badge>{finding.verification_status && <Badge tone={finding.verification_status === "verified" ? "approved" : finding.verification_status === "contradicted" ? "severity" : "status"}>{finding.verification_status === "conflicting_evidence" ? "conflicting evidence" : finding.verification_status}</Badge>}</div>{finding.matched_text && <p className="mt-3 rounded bg-rose-50 px-3 py-2 text-sm text-rose-800">“{finding.matched_text}”</p>}{finding.claim && <p className="mt-2 text-sm text-slate-700"><strong>Claim assessed: </strong>{finding.claim}</p>}<p className="mt-3 text-sm leading-6 text-slate-600">{finding.explanation || finding.description || finding.message}</p>{finding.verification_explanation && <p className="mt-2 text-xs leading-5 text-slate-500">{finding.verification_explanation}</p>}{finding.citations?.map((source, sourceIndex) => <div className="mt-3 rounded border border-slate-200 p-3" key={`${source.url || source.id || source.name}-${sourceIndex}`}><p className="text-xs font-semibold text-slate-700">{source.name || "Evidence source"}</p>{source.excerpt && <p className="mt-1 text-xs leading-5 text-slate-600">{source.excerpt}</p>}{source.url && <a className="mt-1 inline-block text-xs font-medium text-ink-700 underline" href={source.url} target="_blank" rel="noreferrer">Open citation</a>}</div>)}{finding.suggestion && <div className="mt-2"><p className="text-sm text-emerald-800"><strong>Suggestion:</strong> {finding.suggestion}</p>{finding.matched_text && <button className="btn-secondary mt-2 !px-2.5 !py-1.5 !text-xs" type="button" onClick={() => applySuggestion(finding)}>Use suggestion in draft</button>}</div>}<p className="mt-2 text-xs text-slate-400">Guideline: {finding.guideline || finding.source || "Not provided"}{finding.confidence != null ? ` · Confidence ${Math.round(Number(finding.confidence) * 100)}%` : ""}</p></article>)}</div> : <EmptyState title="No findings supplied" description="This review has no analysis findings to display." />}</section>
       </div>
       <div className="space-y-5">
+        {analysisRuns.length > 0 && <section className="card p-5"><div className="mb-3 flex items-center gap-2"><History size={17} className="text-ink-600" /><h2 className="font-semibold text-ink-900">Analysis history</h2></div><div className="space-y-2">{[...analysisRuns].reverse().map((run, index) => <details className="rounded-lg border border-slate-200 p-3" key={run.id || index}><summary className="cursor-pointer text-sm font-medium text-slate-800">{run.analysis_engine === "rules" ? "Deterministic checks" : run.analysis_engine || "Analysis"} · {run.created_at ? new Date(run.created_at).toLocaleString() : "time unavailable"}</summary><div className="mt-3 space-y-2 text-xs leading-5 text-slate-600"><p>{unwrapList(run.findings).length} findings · {run.evidence_retrieval_method || "no evidence retrieval"}</p>{run.content && <p className="whitespace-pre-wrap rounded bg-slate-50 p-2">{run.content}</p>}{unwrapList(run.warnings).map((warning, warningIndex) => <p className="text-amber-800" key={warningIndex}>Warning: {warning}</p>)}{unwrapList(run.findings).map((finding, findingIndex) => <p key={finding.id || findingIndex}><strong>{finding.title || finding.category || "Finding"}:</strong> {finding.explanation || finding.message}</p>)}</div></details>)}</div></section>}
         {canDecide ? <section className="card p-5"><h2 className="font-semibold text-ink-900">Reviewer decision</h2><p className="mt-1 text-xs leading-5 text-slate-500">Use your judgment. These actions record a human review decision.</p><div className="mt-4 grid gap-2"><button className="btn-primary w-full" onClick={() => updateStatus("approved")} disabled={busy || item.status === "approved"}><CheckCircle2 size={16} />Approve content</button><button className="btn-secondary w-full" onClick={() => updateStatus("changes_requested")} disabled={busy || item.status === "changes_requested"}>Request changes</button><button className="btn-secondary w-full" onClick={() => updateStatus("in_review")} disabled={busy || item.status === "in_review"}>Mark in review</button></div></section> : <section className="card p-5"><h2 className="font-semibold text-ink-900">Reviewer decision</h2><p className="mt-1 text-sm leading-6 text-slate-500">Your Contributor role can comment and suggest revisions. An Admin or Reviewer records the approval decision.</p></section>}
         <section className="card p-5"><div className="flex items-center justify-between gap-2"><div className="flex items-center gap-2"><MessageSquare size={17} className="text-ink-600" /><h2 className="font-semibold text-ink-900">Review comments</h2></div><span className={`inline-flex items-center gap-1.5 text-xs ${liveState === "connected" ? "text-emerald-700" : "text-slate-400"}`}><Radio size={13} />{liveState === "connected" ? "Live" : liveState === "connecting" ? "Connecting…" : "Offline"}</span></div><form className="mt-4" onSubmit={addComment}><label className="sr-only" htmlFor="review-comment">Add a comment</label><textarea id="review-comment" className="field resize-y" rows={3} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Share context or feedback..." /><button className="btn-secondary mt-2 w-full" type="submit" disabled={busy || !comment.trim()}><Send size={15} />Add comment</button></form><div className="mt-4 space-y-3">{comments.length ? comments.map((entry, index) => <div key={entry.id || index} className="rounded-lg bg-slate-50 p-3"><div className="flex justify-between gap-2 text-xs"><span className="font-semibold text-slate-700">{entry.author || entry.user || "Reviewer"}</span><span className="text-slate-400">{entry.created_at ? new Date(entry.created_at).toLocaleString() : ""}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-5 text-slate-600">{entry.comment || entry.text}</p></div>) : <p className="text-xs text-slate-400">No comments yet.</p>}</div></section>
         <section className="card p-5"><div className="flex items-center gap-2"><History size={17} className="text-ink-600" /><h2 className="font-semibold text-ink-900">Revision history</h2></div>

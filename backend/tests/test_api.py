@@ -11,6 +11,15 @@ from sqlalchemy.orm import Session
 from app.models.review_comment import ReviewActivity, ReviewAuditEvent
 
 
+def _approve_source(client, source_id):
+    response = client.patch(
+        "/api/sources/{}/approval".format(source_id),
+        json={"status": "approved"},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
 def test_health_docs_and_seeded_guidelines(client):
     health = client.get("/api/health")
     assert health.status_code == 200
@@ -779,6 +788,76 @@ def test_review_workflow_comments_revisions_and_pagination(client, test_engine):
     assert len(listing.json()["items"]) == 1
 
 
+def test_revision_reanalysis_preserves_prior_findings_and_resets_approval(client):
+    guideline = client.post(
+        "/api/guidelines",
+        json={
+            "name": "Avoid boastful language",
+            "category": "terminology",
+            "description": "Use measured language.",
+            "severity": "medium",
+            "prohibited_terms": ["world class"],
+            "preferred_terms": ["well-made"],
+        },
+    )
+    assert guideline.status_code == 201
+    initial = client.post(
+        "/api/analyze",
+        json={
+            "content": "Our world class service guarantees 100% success.",
+            "guideline_ids": [guideline.json()["id"]],
+        },
+    )
+    assert initial.status_code == 200
+    review_id = initial.json()["id"]
+    before = client.get("/api/reviews/{}".format(review_id)).json()
+    assert len(before["analysis_runs"]) == 1
+    assert any(item["category"] == "unsupported_claim" for item in before["findings"])
+
+    approved = client.patch(
+        "/api/reviews/{}/status".format(review_id),
+        json={"status": "approved"},
+    )
+    assert approved.status_code == 200
+
+    revised_text = "Our thoughtful service supports your everyday work."
+    revised = client.post(
+        "/api/reviews/{}/reanalyze".format(review_id),
+        json={"content": revised_text, "title": "Removed unsupported claim"},
+    )
+    assert revised.status_code == 200
+    body = revised.json()
+    assert body["content"] == revised_text
+    assert body["status"] == "pending"
+    assert len(body["revisions"]) == 1
+    assert len(body["analysis_runs"]) == 2
+    assert body["analysis_runs"][0]["findings"]
+    assert body["analysis_runs"][0]["content"] == before["content"]
+    assert body["analysis_runs"][1]["content"] == revised_text
+    assert body["analysis_runs"][1]["analysis_engine"] == "rules"
+    assert body["findings"] == []
+
+    unchanged = client.post(
+        "/api/reviews/{}/reanalyze".format(review_id),
+        json={"content": revised_text},
+    )
+    assert unchanged.status_code == 422
+
+
+def test_revision_reanalysis_enforces_content_byte_limit(client, monkeypatch):
+    from app.routes import reviews
+
+    review_id = client.post(
+        "/api/analyze", json={"content": "A simple draft."}
+    ).json()["id"]
+    monkeypatch.setattr(reviews, "MAX_CONTENT_LENGTH", 3)
+    response = client.post(
+        "/api/reviews/{}/reanalyze".format(review_id),
+        json={"content": "four"},
+    )
+    assert response.status_code == 413
+
+
 def test_image_upload_is_validated_and_explains_visual_limits(client):
     buffer = BytesIO()
     Image.new("RGB", (12, 10), color="white").save(buffer, format="PNG")
@@ -955,6 +1034,8 @@ def test_approved_sources_retrieval_and_expiry_metadata(client):
     )
     assert source.status_code == 201
     source_id = source.json()["id"]
+    assert source.json()["approval_status"] == "pending"
+    _approve_source(client, source_id)
 
     response = client.post(
         "/api/analyze",
@@ -997,6 +1078,166 @@ def test_approved_sources_retrieval_and_expiry_metadata(client):
     assert unsafe_url.status_code == 422
 
 
+def test_evidence_requires_review_and_records_reviewer_decisions(
+    client, test_engine
+):
+    source = client.post(
+        "/api/sources",
+        json={
+            "name": "Product evidence",
+            "content": "The annual subscription price is $240.",
+        },
+    )
+    assert source.status_code == 201
+    source_id = source.json()["id"]
+    assert source.json()["approval_status"] == "pending"
+
+    blocked = client.post(
+        "/api/analyze",
+        json={
+            "content": "The annual subscription price is $240.",
+            "source_ids": [source_id],
+        },
+    )
+    assert blocked.status_code == 422
+    assert "unapproved source" in blocked.json()["detail"]
+
+    from app.models.user import User
+    from app.services.auth_service import hash_password
+
+    with Session(test_engine) as db:
+        db.add(
+            User(
+                email="evidence-reviewer@example.test",
+                display_name="Evidence Reviewer",
+                password_hash=hash_password("reviewer-password-123"),
+                role="reviewer",
+                is_active=True,
+            )
+        )
+        db.add(
+            User(
+                email="evidence-contributor@example.test",
+                display_name="Evidence Contributor",
+                password_hash=hash_password("contributor-password-123"),
+                role="contributor",
+                is_active=True,
+            )
+        )
+        db.commit()
+
+    client.cookies.clear()
+    login = client.post(
+        "/api/auth/login",
+        json={
+            "email": "evidence-reviewer@example.test",
+            "password": "reviewer-password-123",
+        },
+    )
+    assert login.status_code == 200
+
+    rejected = client.patch(
+        "/api/sources/{}/approval".format(source_id),
+        json={"status": "rejected", "note": "The source scope is unclear."},
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["approval_status"] == "rejected"
+    assert rejected.json()["reviewed_by"] == "Evidence Reviewer"
+    assert rejected.json()["review_note"] == "The source scope is unclear."
+    rejected_source = client.post(
+        "/api/analyze",
+        json={
+            "content": "The annual subscription price is $240.",
+            "source_ids": [source_id],
+        },
+    )
+    assert rejected_source.status_code == 422
+
+    approved = client.patch(
+        "/api/sources/{}/approval".format(source_id),
+        json={"status": "approved"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["approval_status"] == "approved"
+    assert len(approved.json()["approval_history"]) == 2
+    assert [event["status"] for event in approved.json()["approval_history"]] == [
+        "rejected",
+        "approved",
+    ]
+
+    client.post("/api/auth/logout")
+    contributor_login = client.post(
+        "/api/auth/login",
+        json={
+            "email": "evidence-contributor@example.test",
+            "password": "contributor-password-123",
+        },
+    )
+    assert contributor_login.status_code == 200
+    unauthorized_decision = client.patch(
+        "/api/sources/{}/approval".format(source_id),
+        json={"status": "rejected"},
+    )
+    assert unauthorized_decision.status_code == 403
+
+    analysis = client.post(
+        "/api/analyze",
+        json={
+            "content": "The annual subscription price is $240.",
+            "source_ids": [source_id],
+        },
+    )
+    assert analysis.status_code == 200
+    assert analysis.json()["retrieved_evidence"][0]["name"] == "Product evidence"
+
+
+def test_legacy_sources_migrate_as_pending_and_are_not_trusted(
+    test_engine, monkeypatch
+):
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.services import auth_service
+
+    monkeypatch.setattr(auth_service, "BOOTSTRAP_ADMIN_EMAIL", "admin@example.test")
+    monkeypatch.setattr(
+        auth_service, "BOOTSTRAP_ADMIN_PASSWORD", "test-admin-password-123"
+    )
+    with test_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE source_documents ("
+            "id INTEGER PRIMARY KEY, name VARCHAR(160) NOT NULL, content TEXT NOT NULL, "
+            "guideline_id INTEGER, url VARCHAR(2048), source_date DATE, expiry_date DATE, "
+            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO source_documents (id, name, content) "
+            "VALUES (1, 'Legacy source', 'The annual subscription price is $240.')"
+        )
+
+    app = create_app(test_engine)
+    with TestClient(app) as legacy_client:
+        login = legacy_client.post(
+            "/api/auth/login",
+            json={
+                "email": "admin@example.test",
+                "password": "test-admin-password-123",
+            },
+        )
+        assert login.status_code == 200
+        sources = legacy_client.get("/api/sources")
+        assert sources.status_code == 200
+        assert sources.json()[0]["approval_status"] == "pending"
+        blocked = legacy_client.post(
+            "/api/analyze",
+            json={
+                "content": "The annual subscription price is $240.",
+                "source_ids": [1],
+            },
+        )
+        assert blocked.status_code == 422
+
+
 def test_factual_claim_can_be_contradicted_by_approved_source(client):
     source = client.post(
         "/api/sources",
@@ -1006,6 +1247,7 @@ def test_factual_claim_can_be_contradicted_by_approved_source(client):
         },
     )
     assert source.status_code == 201
+    _approve_source(client, source.json()["id"])
     response = client.post(
         "/api/analyze",
         json={
@@ -1065,6 +1307,43 @@ def test_external_search_failure_keeps_claim_unverified(client, monkeypatch):
         if item["category"] == "factual_claim"
     )
     assert finding["verification_status"] == "unverified"
+
+
+def test_external_search_results_are_candidates_not_approved_evidence(
+    client, monkeypatch
+):
+    from app.routes import analysis
+
+    async def candidate_only(claim):
+        return [
+            {
+                "name": "External candidate",
+                "url": "https://example.com/facts",
+                "excerpt": claim,
+                "source_type": "external_trusted_source",
+                "freshness": "unknown",
+                "verification": "candidate_evidence_requires_human_review",
+            }
+        ]
+
+    monkeypatch.setattr(analysis, "FACT_CHECK_ENABLED", True)
+    monkeypatch.setattr(analysis, "FACT_CHECK_PROVIDER", "brave")
+    monkeypatch.setattr(analysis, "TRUSTED_SOURCE_DOMAINS", ("example.com",))
+    monkeypatch.setattr(analysis, "search_trusted_sources", candidate_only)
+    response = client.post(
+        "/api/analyze",
+        json={
+            "content": "Our annual subscription price is $300.",
+            "allow_external_verification": True,
+        },
+    )
+    assert response.status_code == 200
+    finding = next(
+        item for item in response.json()["findings"]
+        if item["category"] == "factual_claim"
+    )
+    assert finding["verification_status"] == "unverified"
+    assert finding["citations"] == []
 
 
 def test_external_search_requires_explicit_opt_in(client, monkeypatch):
@@ -1206,6 +1485,7 @@ def test_expired_source_is_never_presented_as_current_evidence(client):
         },
     )
     assert source.status_code == 201
+    _approve_source(client, source.json()["id"])
     result = client.post(
         "/api/analyze",
         json={
@@ -1235,6 +1515,7 @@ def test_semantic_retrieval_finds_non_lexical_match_and_caches_source_vectors(
             "/api/sources", json={"name": name, "content": content}
         )
         assert response.status_code == 201
+        _approve_source(client, response.json()["id"])
         source_ids.append(response.json()["id"])
 
     monkeypatch.setattr(source_retrieval, "EMBEDDING_MODEL", "test-embedding")
@@ -1273,11 +1554,22 @@ def test_semantic_retrieval_finds_non_lexical_match_and_caches_source_vectors(
     assert len(provider_inputs[1]) == 1
 
 
-def test_semantic_embedding_provider_failure_is_explicit(client, monkeypatch):
+def test_semantic_embedding_provider_failure_falls_back_to_lexical_retrieval(
+    client, monkeypatch
+):
     from app.routes import analysis
     from app.services import source_retrieval
 
     monkeypatch.setattr(source_retrieval, "EMBEDDING_MODEL", "test-embedding")
+    source = client.post(
+        "/api/sources",
+        json={
+            "name": "Approved customer study",
+            "content": "Studies show our service is popular among 42 percent of surveyed customers.",
+        },
+    )
+    assert source.status_code == 201
+    _approve_source(client, source.json()["id"])
 
     async def fail_provider(*_args, **_kwargs):
         raise source_retrieval.EmbeddingProviderError(
@@ -1286,11 +1578,17 @@ def test_semantic_embedding_provider_failure_is_explicit(client, monkeypatch):
 
     monkeypatch.setattr(analysis, "retrieve_evidence", fail_provider)
     response = client.post(
-        "/api/analyze", json={"content": "Studies show our service is popular."}
+        "/api/analyze",
+        json={
+            "content": "Studies show our service is popular among 42 percent of surveyed customers.",
+            "source_ids": [source.json()["id"]],
+        },
     )
-    assert response.status_code == 502
-    assert "embedding provider request failed" in response.json()["detail"]
-    assert client.get("/api/reviews").json()["total"] == 0
+    assert response.status_code == 200
+    body = response.json()
+    assert body["evidence_retrieval_method"] == "bm25_lexical_fallback"
+    assert any("embedding provider request failed" in warning for warning in body["provider_warnings"])
+    assert client.get("/api/reviews").json()["total"] == 1
 
 
 def test_embedding_provider_uses_openai_compatible_endpoint_and_orders_vectors(
@@ -1386,7 +1684,9 @@ def test_review_websocket_receives_persisted_comments(client):
     assert client.get("/api/reviews/{}".format(review_id)).json()["content"] == "Persisted collaborative text"
 
 
-def test_llm_provider_errors_are_explicit_and_do_not_save_reviews(client, monkeypatch):
+def test_llm_provider_failure_is_reported_without_blocking_deterministic_analysis(
+    client, monkeypatch
+):
     from app.routes import analysis
     from app.services.llm_analyzer import LLMProviderError
 
@@ -1395,10 +1695,16 @@ def test_llm_provider_errors_are_explicit_and_do_not_save_reviews(client, monkey
 
     monkeypatch.setattr(analysis, "llm_enabled", lambda: True)
     monkeypatch.setattr(analysis, "analyze_with_llm", fail_provider)
-    response = client.post("/api/analyze", json={"content": "A draft."})
-    assert response.status_code == 502
-    assert "provider request failed" in response.json()["detail"]
-    assert client.get("/api/reviews").json()["total"] == 0
+    response = client.post(
+        "/api/analyze",
+        json={"content": "Our service guarantees 100% success for every customer."},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["analysis_engine"] == "rules"
+    assert any("provider request failed" in warning for warning in body["provider_warnings"])
+    assert any(finding["category"] == "unsupported_claim" for finding in body["findings"])
+    assert client.get("/api/reviews").json()["total"] == 1
 
 
 def test_configured_llm_findings_are_merged_and_labeled(client, monkeypatch):

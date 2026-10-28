@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Check, Clipboard, FileImage, FilePlus2, LoaderCircle, Sparkles, X } from "lucide-react";
 import { api, errorMessage, MOCK_MODE, unwrapList } from "../services/api";
 import { Badge, EmptyState, ErrorMessage, PageHeader, SuccessMessage } from "../components/common/UI";
+import { applySuggestionToContent, getSafeReplacement } from "../utils/applySuggestion";
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const ACCEPTED = ["image/png", "image/jpeg", "image/webp"];
@@ -38,7 +39,7 @@ export default function ContentReviewPage() {
     Promise.all([api.guidelines(), api.sources()])
       .then(([guidelineResponse, sourceResponse]) => {
         setGuidelines(unwrapList(guidelineResponse));
-        setSources(unwrapList(sourceResponse));
+        setSources(unwrapList(sourceResponse).filter((source) => source.approval_status === "approved"));
       })
       .catch((err) => setGuidelineError(errorMessage(err)));
     api.health()
@@ -81,14 +82,36 @@ export default function ContentReviewPage() {
     finally { setLoading(false); }
   };
   const applySuggestion = (finding) => {
-    const matched = field(finding, "matched_text", "matchedText", "text");
-    const suggestion = field(finding, "suggestion", "suggested_correction", "correction");
-    if (!matched || !suggestion) return;
-    const index = content.indexOf(matched);
-    if (index < 0) { setError(`Couldn't find “${matched}” in the current text. Copy the suggestion and edit manually.`); return; }
-    setContent(`${content.slice(0, index)}${suggestion}${content.slice(index + matched.length)}`);
-    setSuccess("Suggestion applied to the matching phrase. Your full text remains editable.");
-  };
+  const matched = field(finding, "matched_text", "matchedText", "text");
+  const suggestion = field(finding, "suggestion", "suggested_correction", "correction");
+  const category = field(finding, "category", "type");
+
+  if (!matched || !suggestion) {
+    setError("This finding does not contain usable text and guidance.");
+    return;
+  }
+
+  const safe = getSafeReplacement(String(matched), String(suggestion), category);
+  if (!safe.ok) {
+    setError("This suggestion is guidance, not ready-to-insert replacement text. Edit the draft manually.");
+    return;
+  }
+
+  const result = applySuggestionToContent(content, String(matched), safe.replacement);
+  if (!result.ok) {
+    const messages = {
+      "not-found": `Couldn't find “${matched}” in the current text. Edit the draft manually.`,
+      ambiguous: `“${matched}” appears more than once. Edit the intended occurrence manually.`,
+      "missing-text": "The finding does not contain usable replacement text.",
+      "invalid-input": "This suggestion cannot be applied automatically.",
+    };
+    setError(messages[result.reason] || "This suggestion cannot be applied automatically.");
+    return;
+  }
+
+  setContent(result.content);
+  setSuccess("Approved terminology replacement applied. Review the draft before saving.");
+};
   const copySuggestion = async (finding) => {
     const suggestion = field(finding, "suggestion", "suggested_correction", "correction");
     try { await navigator.clipboard.writeText(String(suggestion || "")); setCopied(finding.id); window.setTimeout(() => setCopied(""), 1500); }
@@ -136,6 +159,7 @@ export default function ContentReviewPage() {
       <section className="card min-h-[400px]" aria-live="polite">
         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><div><h2 className="font-semibold text-ink-900">Analysis findings</h2><p className="mt-1 text-xs text-slate-500">Review each recommendation before applying</p></div>{findings.length > 0 && <Badge>{findings.length} findings</Badge>}</div>
         {!result ? <EmptyState icon={Sparkles} title="Your findings will appear here" description="Submit your draft to receive guideline-based feedback. Nothing is approved automatically." /> : <>
+          {result.provider_warnings?.length > 0 && <div className="border-b border-amber-200 bg-amber-50 px-5 py-3 text-sm text-amber-900" role="status"><p className="font-semibold">An optional AI service was unavailable.</p><ul className="mt-1 list-disc space-y-1 pl-5 text-xs leading-5">{result.provider_warnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}</ul></div>}
           <div className="flex flex-wrap gap-2 border-b border-slate-100 px-5 py-3">
             <select aria-label="Filter by category" className="rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-600" value={category} onChange={(e) => setCategory(e.target.value)}><option value="all">All categories</option>{categories.map((c) => <option value={c} key={c}>{c}</option>)}</select>
             <select aria-label="Filter by severity" className="rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-600" value={severity} onChange={(e) => setSeverity(e.target.value)}><option value="all">All severity</option>{["high", "medium", "low", "critical"].map((v) => <option key={v}>{v}</option>)}</select>
@@ -146,7 +170,7 @@ export default function ContentReviewPage() {
             return <article key={item.id || index} className="rounded-lg border border-slate-200 p-4">
               <div className="flex flex-wrap items-center gap-2"><span className="text-xs font-semibold text-ink-700">{field(item, "category", "type") || "Finding"}</span><Badge tone="severity">{item.severity || "medium"}</Badge><span className="ml-auto"><Badge tone="status">{item.status || "open"}</Badge></span></div>
               <p className="mt-3 text-sm leading-6 text-slate-700">{field(item, "explanation", "description", "message") || "Review this item against the applicable guideline."}</p>
-              {item.verification_status && <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Claim verification</span><Badge tone={item.verification_status === "verified" ? "approved" : item.verification_status === "contradicted" ? "severity" : "status"}>{item.verification_status}</Badge></div>{item.claim && <p className="mt-2 text-xs leading-5 text-slate-700"><strong>Claim assessed: </strong>{item.claim}</p>}<p className="mt-2 text-xs leading-5 text-slate-600">{item.verification_explanation || (item.verification_status === "unverified" ? "Lack of evidence is not proof that this claim is false." : "")}</p>{item.citations?.map((source, sourceIndex) => <div key={`${source.url || source.id || source.name}-${sourceIndex}`} className="mt-2 border-t border-slate-200 pt-2"><p className="text-xs font-medium text-slate-700">{source.name || "Evidence source"}{source.source_type === "external_trusted_source" ? " · external trusted source" : " · approved source"}</p>{source.excerpt && <p className="mt-1 text-xs leading-5 text-slate-600">{source.excerpt}</p>}{source.url && <a className="mt-1 inline-block text-xs font-medium text-ink-700 underline" href={source.url} target="_blank" rel="noreferrer">Open citation</a>}</div>)}</div>}
+              {item.verification_status && <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Claim verification</span><Badge tone={item.verification_status === "verified" ? "approved" : item.verification_status === "contradicted" ? "severity" : "status"}>{item.verification_status === "conflicting_evidence" ? "conflicting evidence" : item.verification_status}</Badge></div>{item.claim && <p className="mt-2 text-xs leading-5 text-slate-700"><strong>Claim assessed: </strong>{item.claim}</p>}<p className="mt-2 text-xs leading-5 text-slate-600">{item.verification_explanation || (item.verification_status === "unverified" ? "Lack of evidence is not proof that this claim is false." : "")}</p>{item.citations?.map((source, sourceIndex) => <div key={`${source.url || source.id || source.name}-${sourceIndex}`} className="mt-2 border-t border-slate-200 pt-2"><p className="text-xs font-medium text-slate-700">{source.name || "Evidence source"}{source.source_type === "external_trusted_source" ? " · external trusted source" : " · approved source"}</p>{source.excerpt && <p className="mt-1 text-xs leading-5 text-slate-600">{source.excerpt}</p>}{source.url && <a className="mt-1 inline-block text-xs font-medium text-ink-700 underline" href={source.url} target="_blank" rel="noreferrer">Open citation</a>}</div>)}</div>}
               {matched && <div className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-800"><span className="font-semibold">Flagged text: </span>“{matched}”</div>}
               {suggestion && <div className="mt-3 rounded-md border border-emerald-100 bg-emerald-50/60 p-3"><p className="text-[11px] font-bold uppercase tracking-wide text-emerald-800">Suggested correction</p><p className="mt-1 text-sm leading-5 text-emerald-900">{suggestion}</p><div className="mt-2 flex flex-wrap gap-2"><button className="btn-secondary !px-2.5 !py-1.5 !text-xs" onClick={() => applySuggestion(item)} type="button"><Check size={13} />Apply to text</button><button className="btn-secondary !px-2.5 !py-1.5 !text-xs" onClick={() => copySuggestion(item)} type="button">{copied === item.id ? <Check size={13} /> : <Clipboard size={13} />}{copied === item.id ? "Copied" : "Copy"}</button></div></div>}
               <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400"><span>Guideline: {field(item, "guideline", "source", "reference") || "Not supplied"}</span>{field(item, "confidence", "confidence_score") != null && <span>Confidence: {Math.round(Number(field(item, "confidence", "confidence_score")) * (Number(field(item, "confidence", "confidence_score")) <= 1 ? 100 : 1))}%</span>}</div>

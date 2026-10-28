@@ -56,4 +56,19 @@ def review_payload(review: ContentReview) -> Dict[str, Any]:
             }
             for revision in review.revisions
         ],
+        "analysis_runs": [
+            {
+                "id": run.id,
+                "content": run.content,
+                "findings": run.findings or [],
+                "analysis_engine": run.analysis_engine,
+                "evidence_retrieval_method": run.evidence_retrieval_method,
+                "warnings": run.warnings or [],
+                "created_by": (
+                    run.created_by.display_name if run.created_by else None
+                ),
+                "created_at": run.created_at,
+            }
+            for run in review.analysis_runs
+        ],
     }
