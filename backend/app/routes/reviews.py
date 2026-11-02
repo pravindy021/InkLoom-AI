@@ -2209,16 +2209,13 @@ async def reanalyze_revision(
 async def review_collaboration(
     websocket: WebSocket,
     review_id: int,
-    db: Session = Depends(get_db),
 ):
-    review = db.get(ContentReview, review_id)
+    """
+    WebSocket collaboration endpoint.
 
-    if review is None:
-        await websocket.close(
-            code=4404,
-            reason="Review not found.",
-        )
-        return
+    Database sessions are deliberately short-lived: no SQLAlchemy session or
+    checked-out database connection is held while waiting for WebSocket traffic.
+    """
 
     from app.config import AUTH_COOKIE_NAME
 
@@ -2229,43 +2226,86 @@ async def review_collaboration(
         )
         return
 
-    user = authenticate_token(
-        db,
-        websocket.cookies.get(AUTH_COOKIE_NAME),
-    )
+    token = websocket.cookies.get(AUTH_COOKIE_NAME)
 
-    if user is None:
+    # Load review ownership and authenticate using a short-lived DB session.
+    with websocket.app.state.session_factory() as auth_db:
+        review = auth_db.get(ContentReview, review_id)
+        if review is None:
+            rejection = (4404, "Review not found.")
+            submitted_by_id = None
+            user_id = None
+            display_name = None
+            user_role = None
+        else:
+            submitted_by_id = review.submitted_by_id
+            user = authenticate_token(auth_db, token)
+
+            if user is None:
+                rejection = (4401, "Sign in to collaborate.")
+            elif user.must_change_password:
+                rejection = (
+                    4403,
+                    "Change your temporary password first.",
+                )
+            elif user.role not in {"admin", "reviewer"} and not (
+                user.role == "contributor"
+                and submitted_by_id == user.id
+            ):
+                rejection = (
+                    4403,
+                    "You are not authorized to collaborate on this review.",
+                )
+            else:
+                rejection = None
+                user_id = user.id
+                display_name = user.display_name
+                user_role = user.role
+
+    # The session above is closed before the socket is accepted or kept alive.
+    if rejection is not None:
         await websocket.close(
-            code=4401,
-            reason="Sign in to collaborate.",
+            code=rejection[0],
+            reason=rejection[1],
         )
         return
 
-    if user.must_change_password:
-        await websocket.close(
-            code=4403,
-            reason="Change your temporary password first.",
-        )
-        return
+    async def get_active_identity():
+        """Revalidate the cookie without retaining a DB connection."""
+        with websocket.app.state.session_factory() as auth_db:
+            active_user = authenticate_token(auth_db, token)
+            if (
+                active_user is None
+                or active_user.must_change_password
+                or (
+                    active_user.role not in {"admin", "reviewer"}
+                    and not (
+                        active_user.role == "contributor"
+                        and submitted_by_id == active_user.id
+                    )
+                )
+            ):
+                return None
 
-    if user.role not in {"admin", "reviewer"} and not (
-        user.role == "contributor" and review.submitted_by_id == user.id
-    ):
-        await websocket.close(
-            code=4403,
-            reason="You are not authorized to collaborate on this review.",
-        )
-        return
+            # Return plain values, not detached ORM objects.
+            return {
+                "id": active_user.id,
+                "display_name": active_user.display_name,
+                "role": active_user.role,
+            }
 
-    await collaboration_hub.connect(
-        review_id,
-        websocket,
-        user.id,
-        user.display_name,
-        user.role,
-    )
+    connected = False
 
     try:
+        await collaboration_hub.connect(
+            review_id,
+            websocket,
+            user_id,
+            display_name,
+            user_role,
+        )
+        connected = True
+
         participants = await collaboration_hub.participants(review_id)
         await websocket.send_json(
             {
@@ -2296,55 +2336,26 @@ async def review_collaboration(
                     websocket.receive_text(),
                     timeout=60,
                 )
-
             except asyncio.TimeoutError:
-                db.expire_all()
-                active_user = authenticate_token(
-                    db,
-                    websocket.cookies.get(AUTH_COOKIE_NAME),
-                )
-
-                if (
-                    active_user is None
-                    or active_user.must_change_password
-                    or (
-                        active_user.role not in {"admin", "reviewer"}
-                        and not (
-                            active_user.role == "contributor"
-                            and review.submitted_by_id == active_user.id
-                        )
-                    )
-                ):
+                active_identity = await get_active_identity()
+                if active_identity is None:
                     await websocket.close(
                         code=4401,
                         reason="Workspace session expired.",
                     )
                     break
-
                 continue
 
-            db.expire_all()
-            active_user = authenticate_token(
-                db,
-                websocket.cookies.get(AUTH_COOKIE_NAME),
-            )
-            if (
-                active_user is None
-                or active_user.must_change_password
-                or (
-                    active_user.role not in {"admin", "reviewer"}
-                    and not (
-                        active_user.role == "contributor"
-                        and review.submitted_by_id == active_user.id
-                    )
-                )
-            ):
+            active_identity = await get_active_identity()
+            if active_identity is None:
                 await websocket.close(
                     code=4401,
                     reason="Workspace access changed.",
                 )
                 break
-            user = active_user
+
+            # Keep the display name current if the account profile changed.
+            display_name = active_identity["display_name"]
 
             if len(raw.encode("utf-8")) > 2048:
                 await websocket.send_json(
@@ -2357,7 +2368,6 @@ async def review_collaboration(
 
             try:
                 message = json.loads(raw)
-
             except json.JSONDecodeError:
                 await websocket.send_json(
                     {
@@ -2375,9 +2385,7 @@ async def review_collaboration(
                     isinstance(message, dict)
                     and message.get("type") == "draft_changed"
                     and isinstance(message.get("content"), str)
-                    and len(
-                        message["content"].encode("utf-8")
-                    ) <= 100_000
+                    and len(message["content"].encode("utf-8")) <= 100_000
                 ):
                     await collaboration_hub.broadcast(
                         review_id,
@@ -2385,7 +2393,7 @@ async def review_collaboration(
                             "type": "draft_changed",
                             "payload": {
                                 "content": message["content"],
-                                "user": user.display_name,
+                                "user": display_name,
                             },
                         },
                     )
@@ -2405,10 +2413,8 @@ async def review_collaboration(
             payload = {
                 "type": message["type"],
                 "payload": {
-                    "user": user.display_name,
-                    "active": bool(
-                        message.get("active", True)
-                    ),
+                    "user": display_name,
+                    "active": bool(message.get("active", True)),
                 },
             }
 
@@ -2421,19 +2427,22 @@ async def review_collaboration(
         pass
 
     finally:
-        await collaboration_hub.disconnect(
-            review_id,
-            websocket,
-            user.id,
-        )
-        await collaboration_hub.broadcast(
-            review_id,
-            {
-                "type": "presence",
-                "payload": {
-                    "event": "left",
-                    "review_id": review_id,
-                    "participants": await collaboration_hub.participants(review_id),
+        if connected:
+            await collaboration_hub.disconnect(
+                review_id,
+                websocket,
+                user_id,
+            )
+            await collaboration_hub.broadcast(
+                review_id,
+                {
+                    "type": "presence",
+                    "payload": {
+                        "event": "left",
+                        "review_id": review_id,
+                        "participants": await collaboration_hub.participants(
+                            review_id
+                        ),
+                    },
                 },
-            },
-        )
+            )

@@ -133,6 +133,7 @@ def create_app(
         version=API_VERSION,
         lifespan=lifespan,
     )
+    app.state.session_factory = local_sessions
     @app.middleware("http")
     async def validate_session_request_origin(request, call_next):
         if (
