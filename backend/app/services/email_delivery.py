@@ -1,5 +1,7 @@
 import smtplib
 import ssl
+import logging
+logger = logging.getLogger(__name__)
 from email.message import EmailMessage
 
 from app.config import (
@@ -45,4 +47,14 @@ def send_email(recipient: str, subject: str, body: str) -> None:
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.send_message(message)
     except (OSError, smtplib.SMTPException) as exc:
+        logger.exception(
+            "SMTP delivery failed: error_type=%s host=%s port=%s "
+            "starttls=%s ssl=%s username_configured=%s",
+            type(exc).__name__,
+            SMTP_HOST,
+            SMTP_PORT,
+            SMTP_STARTTLS,
+            SMTP_USE_SSL,
+            bool(SMTP_USERNAME),
+        )
         raise EmailDeliveryError("Email delivery failed.") from exc
