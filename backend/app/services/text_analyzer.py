@@ -7,6 +7,7 @@ from app.services.claim_checker import (
     check_promotional_claims,
     factual_claim_spans,
 )
+from app.services.accessibility_analyzer import analyze_text_accessibility
 from app.services.brand_voice_checker import check_brand_voice
 from app.services.suggestion_engine import (
     claim_suggestion,
@@ -268,22 +269,7 @@ def analyze_text(
                 }
             )
 
-    click_here = re.search(r"\bclick here\b", text, re.IGNORECASE)
-    if click_here:
-        findings.append(
-            {
-                "category": "accessibility",
-                "severity": "low",
-                "title": "Non-descriptive link wording",
-                "explanation": "“Click here” does not describe the destination and can be less useful to assistive-technology users.",
-                "matched_text": click_here.group(0),
-                "suggestion": "Replace it with a concise link label that describes the destination or action.",
-                "source": "Basic accessibility heuristic (not a WCAG audit)",
-                "guideline": None,
-                "guideline_id": None,
-                "confidence": 0.82,
-            }
-        )
+    findings.extend(analyze_text_accessibility(text))
 
     if image_attached and not (alt_text or "").strip():
         findings.append(

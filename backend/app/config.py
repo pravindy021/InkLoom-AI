@@ -69,9 +69,53 @@ CORS_ORIGINS = list(
 )
 MAX_CONTENT_LENGTH = _integer_setting("MAX_CONTENT_LENGTH", 100_000, 1)
 MAX_UPLOAD_SIZE = _integer_setting("MAX_UPLOAD_SIZE", 10 * 1024 * 1024, 1)
+MAX_VIDEO_UPLOAD_SIZE = _validated_integer_setting(
+    "MAX_VIDEO_UPLOAD_SIZE", 50 * 1024 * 1024, 1, 200 * 1024 * 1024
+)
+MAX_VIDEO_DURATION_SECONDS = _validated_integer_setting(
+    "MAX_VIDEO_DURATION_SECONDS", 600, 1, 3600
+)
+VIDEO_FRAME_INTERVAL_SECONDS = _validated_integer_setting(
+    "VIDEO_FRAME_INTERVAL_SECONDS", 15, 1, 120
+)
+VIDEO_MAX_FRAMES = _validated_integer_setting("VIDEO_MAX_FRAMES", 20, 1, 60)
+VIDEO_FFMPEG_BINARY = os.getenv("VIDEO_FFMPEG_BINARY", "ffmpeg").strip()
+VIDEO_FFPROBE_BINARY = os.getenv("VIDEO_FFPROBE_BINARY", "ffprobe").strip()
+VIDEO_TRANSCRIPTION_API_URL = os.getenv(
+    "VIDEO_TRANSCRIPTION_API_URL", ""
+).strip()
+VIDEO_TRANSCRIPTION_API_KEY = os.getenv(
+    "VIDEO_TRANSCRIPTION_API_KEY", ""
+).strip()
+VIDEO_TRANSCRIPTION_MODEL = os.getenv(
+    "VIDEO_TRANSCRIPTION_MODEL", "whisper-1"
+).strip()
+if VIDEO_TRANSCRIPTION_API_URL and not VIDEO_TRANSCRIPTION_MODEL:
+    raise ValueError(
+        "Configure VIDEO_TRANSCRIPTION_API_URL and VIDEO_TRANSCRIPTION_MODEL together."
+    )
+if VIDEO_TRANSCRIPTION_API_KEY and not VIDEO_TRANSCRIPTION_API_URL:
+    raise ValueError(
+        "VIDEO_TRANSCRIPTION_API_KEY requires VIDEO_TRANSCRIPTION_API_URL."
+    )
+if VIDEO_TRANSCRIPTION_API_URL:
+    transcription_url = urlsplit(VIDEO_TRANSCRIPTION_API_URL)
+    if (
+        transcription_url.scheme != "https"
+        or not transcription_url.hostname
+        or transcription_url.username
+        or transcription_url.password
+        or transcription_url.query
+        or transcription_url.fragment
+    ):
+        raise ValueError(
+            "VIDEO_TRANSCRIPTION_API_URL must be an HTTPS URL without embedded credentials, query, or fragment."
+        )
+VIDEO_TRANSCRIPTION_ENABLED = bool(VIDEO_TRANSCRIPTION_API_URL)
 MAX_SOURCE_UPLOAD_SIZE = _integer_setting("MAX_SOURCE_UPLOAD_SIZE", 10 * 1024 * 1024, 1)
 MAX_SOURCE_LENGTH = _integer_setting("MAX_SOURCE_LENGTH", 200_000, 1)
 OCR_ENABLED = os.getenv("OCR_ENABLED", "false").lower() == "true"
+MAX_OCR_PAGES = _validated_integer_setting("MAX_OCR_PAGES", 20, 1, 100)
 LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "").strip().rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "").strip()

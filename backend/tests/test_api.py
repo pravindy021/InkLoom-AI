@@ -1409,14 +1409,7 @@ def test_analytics_are_based_on_persisted_review_data(client):
         "/api/analytics/guideline-blind-spots"
     )
     assert blind_spots.status_code == 200
-    assert (
-        blind_spots.json()[0]["guideline"]
-        == "Substantiated promotional claims"
-    )
-    assert (
-        "does not prove guideline ambiguity"
-        in blind_spots.json()[0]["heuristic"]
-    )
+    assert blind_spots.json() == []
 
 
 def test_analytics_date_range_filters_reviews_and_rejects_reversed_range(client):
@@ -2649,6 +2642,7 @@ def test_semantic_retrieval_finds_non_lexical_match_and_caches_source_vectors(
     payload = {
         "content": "Studies show our service is popular.",
         "source_ids": source_ids,
+        "allow_external_ai_processing": True,
     }
 
     first = client.post("/api/analyze", json=payload)
@@ -2724,6 +2718,7 @@ def test_semantic_embedding_provider_failure_falls_back_to_lexical_retrieval(
                 "42 percent of surveyed customers."
             ),
             "source_ids": [source.json()["id"]],
+            "allow_external_ai_processing": True,
         },
     )
 
@@ -2930,7 +2925,8 @@ def test_llm_provider_failure_is_reported_without_blocking_deterministic_analysi
             "content": (
                 "Our service guarantees 100% success "
                 "for every customer."
-            )
+            ),
+            "allow_external_ai_processing": True,
         },
     )
 
@@ -2986,7 +2982,10 @@ def test_configured_llm_findings_are_merged_and_labeled(
 
     response = client.post(
         "/api/analyze",
-        json={"content": "A neutral draft."},
+        json={
+            "content": "A neutral draft.",
+            "allow_external_ai_processing": True,
+        },
     )
 
     assert response.status_code == 200

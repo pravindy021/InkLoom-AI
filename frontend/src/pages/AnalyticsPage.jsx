@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Download, LoaderCircle } from "lucide-react";
 import {
   Bar,
   BarChart,
@@ -19,6 +20,8 @@ import {
   LoadingState,
   PageHeader,
 } from "../components/common/UI";
+import { saveDownload } from "../utils/saveDownload";
+import { getGovernanceInsightsState } from "../utils/governanceInsights";
 
 const COLORS = ["#665bb8", "#9188d4", "#b8b3e8", "#d8d6f3", "#b8c7da"];
 
@@ -43,7 +46,10 @@ const toChartRows = (value, keyName) => {
   return [];
 };
 
-function dateRangeFor(period) {
+function dateRangeFor(period, customRange) {
+  if (period === "custom") {
+    return customRange;
+  }
   if (period === "all") return { startDate: "", endDate: "" };
   const end = new Date();
   const start = new Date(end);
@@ -104,15 +110,25 @@ function ActivityList({ entries }) {
 
 export default function AnalyticsPage() {
   const [period, setPeriod] = useState("30");
+  const [customStartDate, setCustomStartDate] = useState("");
+  const [customEndDate, setCustomEndDate] = useState("");
   const [data, setData] = useState(null);
   const [blindSpots, setBlindSpots] = useState([]);
+  const [governanceInsights, setGovernanceInsights] = useState(null);
+  const [governanceError, setGovernanceError] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [exportError, setExportError] = useState("");
+  const [exportNotice, setExportNotice] = useState("");
+  const [exporting, setExporting] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
-    const { startDate, endDate } = dateRangeFor(period);
+    const { startDate, endDate } = dateRangeFor(period, {
+      startDate: customStartDate,
+      endDate: customEndDate,
+    });
     try {
       const [summary, blind] = await Promise.all([
         api.analytics(startDate, endDate),
@@ -120,16 +136,51 @@ export default function AnalyticsPage() {
       ]);
       setData(summary?.data || summary);
       setBlindSpots(unwrapList(blind?.data || blind));
+      try {
+        const insights = await api.governanceInsights(startDate, endDate);
+        setGovernanceInsights(insights?.data || insights);
+        setGovernanceError("");
+      } catch (insightError) {
+        setGovernanceInsights(null);
+        setGovernanceError(errorMessage(insightError));
+      }
     } catch (e) {
       setError(errorMessage(e));
     } finally {
       setLoading(false);
     }
-  }, [period]);
+  }, [period, customStartDate, customEndDate]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  const exportReport = async (format) => {
+    const { startDate, endDate } = dateRangeFor(period, {
+      startDate: customStartDate,
+      endDate: customEndDate,
+    });
+    if (startDate && endDate && startDate > endDate) {
+      setExportError("The start date must be on or before the end date.");
+      setExportNotice("");
+      return;
+    }
+    setExporting(format);
+    setExportError("");
+    setExportNotice("");
+    try {
+      saveDownload(
+        await api.downloadAnalyticsReport(format, startDate, endDate),
+      );
+      setExportNotice(
+        format === "csv" ? "Analytics CSV exported." : "Analytics PDF downloaded.",
+      );
+    } catch (err) {
+      setExportError(errorMessage(err));
+    } finally {
+      setExporting("");
+    }
+  };
 
   const severity = toChartRows(data?.issues_by_severity, "severity");
   const categories = toChartRows(
@@ -144,6 +195,11 @@ export default function AnalyticsPage() {
   const frequent = unwrapList(
     data?.frequent_guidelines || data?.most_triggered_guidelines,
   );
+  const governanceState = getGovernanceInsightsState({
+    insights: governanceInsights,
+    error: governanceError,
+    loading,
+  });
 
   return (
     <>
@@ -152,21 +208,84 @@ export default function AnalyticsPage() {
         title="Analytics"
         description="Understand review patterns and identify where your brand standards need clarity."
         action={
-          <label className="flex items-center gap-2 text-sm text-slate-600">
-            Date range
-            <select
-              className="input min-w-36"
-              onChange={(event) => setPeriod(event.target.value)}
-              value={period}
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-2 text-sm text-slate-600">
+              Date range
+              <select
+                className="input min-w-36"
+                onChange={(event) => setPeriod(event.target.value)}
+                value={period}
+              >
+                <option value="7">Last 7 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="90">Last 90 days</option>
+                <option value="all">All time</option>
+                <option value="custom">Custom</option>
+              </select>
+            </label>
+            <button
+              className="btn-secondary"
+              type="button"
+              disabled={Boolean(exporting)}
+              onClick={() => exportReport("pdf")}
             >
-              <option value="7">Last 7 days</option>
-              <option value="30">Last 30 days</option>
-              <option value="90">Last 90 days</option>
-              <option value="all">All time</option>
-            </select>
-          </label>
+              {exporting === "pdf" ? (
+                <LoaderCircle className="animate-spin" size={16} />
+              ) : (
+                <Download size={16} />
+              )}
+              Download PDF Report
+            </button>
+            <button
+              className="btn-secondary"
+              type="button"
+              disabled={Boolean(exporting)}
+              onClick={() => exportReport("csv")}
+            >
+              {exporting === "csv" ? (
+                <LoaderCircle className="animate-spin" size={16} />
+              ) : (
+                <Download size={16} />
+              )}
+              Export CSV
+            </button>
+          </div>
         }
       />
+      {period === "custom" && (
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          <label className="text-sm text-slate-600">
+            Start date
+            <input
+              className="input ml-2"
+              type="date"
+              value={customStartDate}
+              onChange={(event) => setCustomStartDate(event.target.value)}
+            />
+          </label>
+          <label className="text-sm text-slate-600">
+            End date
+            <input
+              className="input ml-2"
+              type="date"
+              value={customEndDate}
+              onChange={(event) => setCustomEndDate(event.target.value)}
+            />
+          </label>
+        </div>
+      )}
+      {exportError && (
+        <div className="mb-4">
+          <p className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+            {exportError}
+          </p>
+        </div>
+      )}
+      {exportNotice && (
+        <p className="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+          {exportNotice}
+        </p>
+      )}
       {error ? (
         <ErrorState message={error} onRetry={load} />
       ) : loading ? (
@@ -178,6 +297,10 @@ export default function AnalyticsPage() {
         />
       ) : (
         <>
+          <p className="mb-4 text-xs text-slate-500">
+            Reporting period: {data.date_range?.start_date || "all available"} to{" "}
+            {data.date_range?.end_date || "latest"} · Reviews are selected by creation date; trends use UTC calendar months.
+          </p>
           <div className="mb-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <Metric
               label="Total reviews"
@@ -421,9 +544,133 @@ export default function AnalyticsPage() {
               )}
             </ChartCard>
           </div>
+          <div className="mb-5 grid gap-5 xl:grid-cols-2">
+            <ChartCard
+              title="Recurring issue patterns"
+              description="Unique finding records after exact duplicate suppression. Recurrence requires at least two separate reviews."
+            >
+              {governanceState === "error" ? (
+                <p className="mt-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800" role="alert">
+                  Governance insights could not be loaded: {governanceError}
+                </p>
+              ) : governanceInsights?.recurring_categories?.length ? (
+                <div className="mt-4 space-y-3">
+                  {governanceInsights.recurring_categories.map((item) => (
+                    <div
+                      className="flex items-center justify-between gap-3 text-sm"
+                      key={item.category}
+                    >
+                      <span className="capitalize text-slate-700">
+                        {item.category.replaceAll("_", " ")}
+                      </span>
+                      <span className="shrink-0 text-slate-500">
+                        {item.finding_count} findings · {item.review_count} reviews
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState
+                  title="Not enough recurrence data"
+                  description="A category appears here after it is flagged in at least two distinct reviews."
+                />
+              )}
+              {governanceInsights?.issue_counts && (
+                <p className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500">
+                  {governanceInsights.issue_counts.unique_findings} unique findings
+                  {governanceInsights.issue_counts.duplicate_finding_records_ignored
+                    ? ` · ${governanceInsights.issue_counts.duplicate_finding_records_ignored} exact duplicates ignored`
+                    : ""}
+                  {" · "}
+                  {governanceInsights.issue_counts.resolved} explicitly resolved ·{" "}
+                  {governanceInsights.issue_counts.unresolved} open or pending
+                  {governanceInsights.issue_counts.status_unknown
+                    ? ` · ${governanceInsights.issue_counts.status_unknown} status unknown`
+                    : ""}
+                </p>
+              )}
+            </ChartCard>
+
+            <ChartCard
+              title="Governance recommendations"
+              description="Evidence-based prompts for human follow-up, not automated judgments of guideline quality."
+            >
+              {governanceState === "error" ? (
+                <p className="mt-4 text-sm text-slate-500">
+                  Recommendations are unavailable because governance insights failed to load.
+                </p>
+              ) : governanceInsights?.recommendations?.length ? (
+                <ul className="mt-4 space-y-3">
+                  {governanceInsights.recommendations.map((item, index) => (
+                    <li
+                      className="rounded-lg border border-slate-200 bg-slate-50 p-3"
+                      key={`${item.type}-${item.evidence?.guideline_id || item.evidence?.category || index}`}
+                    >
+                      <p className="text-sm font-semibold text-slate-800">
+                        {item.title}
+                      </p>
+                      <p className="mt-1 text-sm leading-5 text-slate-600">
+                        {item.message}
+                      </p>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <EmptyState
+                  title="No action recommendations yet"
+                  description="Recommendations appear when a category or guideline recurs across multiple reviews."
+                />
+              )}
+              {governanceInsights?.review_outcomes && (
+                <p className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500">
+                  {governanceInsights.review_outcomes.changes_requested_events} review-level changes-requested events ·{" "}
+                  {governanceInsights.review_outcomes.approved_events} approvals. These audit events are not attributable to a particular finding or guideline.
+                </p>
+              )}
+            </ChartCard>
+
+            <ChartCard
+              title="Review trend"
+              description="Reviews and unique findings by review creation month; months without records are omitted."
+            >
+              {governanceInsights?.trends_by_month?.length ? (
+                <div className="mt-4 h-64">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={governanceInsights.trends_by_month}>
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                        vertical={false}
+                        stroke="#eef0f5"
+                      />
+                      <XAxis dataKey="month" tickLine={false} axisLine={false} />
+                      <YAxis allowDecimals={false} tickLine={false} axisLine={false} />
+                      <Tooltip />
+                      <Bar
+                        dataKey="review_count"
+                        name="Reviews"
+                        fill="#665bb8"
+                        radius={[4, 4, 0, 0]}
+                      />
+                      <Bar
+                        dataKey="unique_findings"
+                        name="Unique findings"
+                        fill="#b8b3e8"
+                        radius={[4, 4, 0, 0]}
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <EmptyState
+                  title="No trend data"
+                  description="Monthly trends require persisted review timestamps and findings."
+                />
+              )}
+            </ChartCard>
+          </div>
           <ChartCard
             title="Potentially ambiguous guidelines"
-            description="Blind-spot indicators are signals for human review, not definitive quality scores."
+            description="Relative recurrence signals include only guidelines found in at least two distinct reviews; they do not prove unclear wording."
           >
             {blindSpots.length ? (
               <div className="mt-4 overflow-x-auto">
@@ -432,7 +679,7 @@ export default function AnalyticsPage() {
                     <tr>
                       <th className="pb-3">Guideline</th>
                       <th className="pb-3">Ambiguity indicator</th>
-                      <th className="pb-3">Mentions</th>
+                      <th className="pb-3">Findings / reviews</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -448,6 +695,9 @@ export default function AnalyticsPage() {
                         </td>
                         <td className="py-3 text-sm text-slate-500">
                           {item.mentions ?? item.count ?? "—"}
+                          {item.review_count != null
+                            ? ` / ${item.review_count}`
+                            : ""}
                         </td>
                       </tr>
                     ))}

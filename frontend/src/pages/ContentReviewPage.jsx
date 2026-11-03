@@ -5,6 +5,7 @@ import {
   Clipboard,
   FileImage,
   FilePlus2,
+  Film,
   LoaderCircle,
   Sparkles,
   X,
@@ -17,6 +18,7 @@ import {
   PageHeader,
   SuccessMessage,
 } from "../components/common/UI";
+import VisualPaletteComparison from "../components/VisualPaletteComparison";
 import {
   applySuggestionToContent,
   getSafeReplacement,
@@ -32,7 +34,33 @@ import {
 } from "../utils/brandVoiceFindings";
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_VIDEO_FILE_SIZE = 50 * 1024 * 1024;
 const ACCEPTED = ["image/png", "image/jpeg", "image/webp", "application/pdf"];
+const DOCX_TYPE =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const VIDEO_TYPES = {
+  mp4: ["video/mp4"],
+  mov: ["video/quicktime"],
+  webm: ["video/webm"],
+};
+
+function isVideoFile(candidate) {
+  return Boolean(candidate && /\.(mp4|mov|webm)$/i.test(candidate.name));
+}
+
+function isDocxFile(candidate) {
+  return Boolean(candidate && /\.docx$/i.test(candidate.name));
+}
+
+function isPdfFile(candidate) {
+  return Boolean(candidate && /\.pdf$/i.test(candidate.name));
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds)) return "Duration unavailable";
+  const total = Math.floor(seconds);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
 
 const field = (finding, ...keys) =>
   keys
@@ -45,6 +73,9 @@ export default function ContentReviewPage() {
   const [contentType, setContentType] = useState("Campaign");
   const [file, setFile] = useState(null);
   const [fileError, setFileError] = useState("");
+  const [videoPreviewUrl, setVideoPreviewUrl] = useState("");
+  const [videoDuration, setVideoDuration] = useState(null);
+  const [uploadProgress, setUploadProgress] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -65,10 +96,26 @@ export default function ContentReviewPage() {
     embeddings: false,
   });
   const [useExternalCheck, setUseExternalCheck] = useState(false);
+  const [allowExternalAiProcessing, setAllowExternalAiProcessing] = useState(false);
+  const [allowExternalTranscription, setAllowExternalTranscription] = useState(false);
+  const [videoTranscriptionConfigured, setVideoTranscriptionConfigured] = useState(false);
   const [copied, setCopied] = useState("");
 
   const navigate = useNavigate();
   const fileInput = useRef(null);
+  const videoFile = isVideoFile(file);
+
+  useEffect(() => {
+    if (!videoFile || !file) {
+      setVideoPreviewUrl("");
+      setVideoDuration(null);
+      return undefined;
+    }
+    const url = URL.createObjectURL(file);
+    setVideoPreviewUrl(url);
+    setVideoDuration(null);
+    return () => URL.revokeObjectURL(url);
+  }, [file, videoFile]);
 
   const findings = unwrapList(result?.findings || result?.issues);
 
@@ -109,15 +156,18 @@ export default function ContentReviewPage() {
 
     api
       .health()
-      .then((health) =>
+      .then((health) => {
         setExternalCheck({
           configured: Boolean(health?.external_fact_check_configured),
           provider: health?.external_fact_check_provider || null,
           domains: health?.trusted_source_domains || [],
           llm: health?.analysis_mode === "rules+configured_llm",
           embeddings: Boolean(health?.embedding_model_configured),
-        })
-      )
+        });
+        setVideoTranscriptionConfigured(
+          Boolean(health?.video_transcription_configured),
+        );
+      })
       .catch(() =>
         setExternalCheck({
           configured: false,
@@ -132,16 +182,53 @@ export default function ContentReviewPage() {
   const chooseFile = (selected) => {
     setFileError("");
 
-    if (!selected) return;
+    if (!selected) {
+      setFile(null);
+      return;
+    }
 
     const extension = selected.name.split(".").pop()?.toLowerCase();
+    const videoMimeTypes = VIDEO_TYPES[extension];
+    if (videoMimeTypes) {
+      if (!videoMimeTypes.includes(selected.type)) {
+        setFile(null);
+        setFileError("The selected video extension and MIME type do not match.");
+        return;
+      }
+      if (selected.size > MAX_VIDEO_FILE_SIZE) {
+        setFile(null);
+        setFileError("Video must be 50 MB or smaller.");
+        return;
+      }
+      setContentType("Video");
+      setAllowExternalTranscription(false);
+      setFile(selected);
+      return;
+    }
+    if (extension === "docx") {
+      if (selected.type && ![DOCX_TYPE, "application/octet-stream"].includes(selected.type)) {
+        setFile(null);
+        setFileError("The DOCX extension and MIME type do not match.");
+        return;
+      }
+      if (selected.size > MAX_FILE_SIZE) {
+        setFile(null);
+        setFileError("Document must be 10 MB or smaller.");
+        return;
+      }
+      setContentType("Document");
+      setFile(selected);
+      return;
+    }
     const validExtension = ["png", "jpg", "jpeg", "webp", "pdf"].includes(extension);
     if (!validExtension || (selected.type && !ACCEPTED.includes(selected.type))) {
-      setFileError("Choose a PNG, JPG, WEBP, or PDF file.");
+      setFile(null);
+      setFileError("Choose a PNG, JPG, WEBP, PDF, or DOCX file.");
       return;
     }
 
     if (selected.size > MAX_FILE_SIZE) {
+      setFile(null);
       setFileError("File must be 10 MB or smaller.");
       return;
     }
@@ -154,24 +241,28 @@ export default function ContentReviewPage() {
     setError("");
     setSuccess("");
 
-    if (!content.trim()) {
-      setError("Add content before running an analysis.");
+    if (!content.trim() && !videoFile && !isDocxFile(file) && !isPdfFile(file)) {
+      setError("Add content or upload a document or video before running an analysis.");
       return;
     }
 
     setLoading(true);
+    setUploadProgress(file ? 0 : null);
     setResult(null);
 
     try {
       const response = await api.analyze({
         title: title.trim() || "Untitled content",
-        content: content.trim(),
+        content: content.trim() || (videoFile ? `Video review: ${file.name}` : ""),
         content_type: contentType,
         file,
         guideline_ids: selectedGuidelines,
         source_ids: selectedSources,
         alt_text: altText,
         allow_external_verification: useExternalCheck,
+        allow_external_transcription: allowExternalTranscription,
+        allow_external_ai_processing: allowExternalAiProcessing,
+        onUploadProgress: setUploadProgress,
       });
 
       setResult(response?.data || response);
@@ -200,6 +291,8 @@ export default function ContentReviewPage() {
       setError(errorMessage(err));
     } finally {
       setLoading(false);
+      setUploadProgress(null);
+      setAllowExternalAiProcessing(false);
     }
   };
 
@@ -341,6 +434,7 @@ export default function ContentReviewPage() {
             <option>Email</option>
             <option>Product page</option>
             <option>Blog article</option>
+            <option>Video</option>
             <option>Other</option>
           </select>
 
@@ -432,7 +526,8 @@ export default function ContentReviewPage() {
 
           {(externalCheck.llm || externalCheck.embeddings) && (
             <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-950">
-              This workspace has configured remote analysis services:{" "}
+              Configured remote analysis services are used only when you opt in
+              for an analysis:{" "}
               {externalCheck.llm &&
                 "the LLM receives submitted text and guideline context"}
               {externalCheck.llm && externalCheck.embeddings && "; "}
@@ -441,6 +536,33 @@ export default function ContentReviewPage() {
               . Review provider data-handling terms and do not submit confidential
               material unless your organization permits it.
             </p>
+          )}
+
+          {(externalCheck.llm || externalCheck.embeddings) && (
+            <label className="mb-4 flex cursor-pointer items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+              <input
+                className="mt-1 h-4 w-4 accent-ink-700"
+                type="checkbox"
+                checked={allowExternalAiProcessing}
+                onChange={(event) =>
+                  setAllowExternalAiProcessing(event.target.checked)
+                }
+              />
+              <span>
+                <span className="font-semibold">
+                  Allow remote AI/embedding processing for this analysis
+                </span>
+                <span className="mt-1 block text-xs leading-5">
+                  {externalCheck.llm &&
+                    "Submitted text and guideline context may be sent to the configured LLM. "}
+                  {externalCheck.embeddings &&
+                    "Detected claim excerpts and selected approved-source chunks may be sent to the embedding provider. "}
+                  This is separate from external fact checking and video
+                  transcription. Leave unchecked for local deterministic
+                  analysis and lexical retrieval.
+                </span>
+              </span>
+            </label>
           )}
 
           {externalCheck.configured ? (
@@ -481,6 +603,11 @@ export default function ContentReviewPage() {
             className="mb-1.5 block text-sm font-medium text-slate-700"
           >
             Draft content
+            {(videoFile || isDocxFile(file) || isPdfFile(file)) && (
+              <span className="font-normal text-slate-400">
+                {" "}(optional with uploaded document/video)
+              </span>
+            )}
           </label>
 
           <textarea
@@ -494,31 +621,40 @@ export default function ContentReviewPage() {
 
           <div className="mt-5">
             <div className="mb-2 text-sm font-medium text-slate-700">
-              Visual asset{" "}
+              Content file{" "}
               <span className="font-normal text-slate-400">(optional)</span>
             </div>
 
             <input
               ref={fileInput}
               type="file"
-              accept=".png,.jpg,.jpeg,.webp,.pdf,image/png,image/jpeg,image/webp,application/pdf"
+              accept=".png,.jpg,.jpeg,.webp,.pdf,.docx,.mp4,.mov,.webm,image/png,image/jpeg,image/webp,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,video/mp4,video/quicktime,video/webm"
               className="sr-only"
               onChange={(e) => {
                 chooseFile(e.target.files?.[0]);
                 e.target.value = "";
               }}
-              aria-label="Upload visual file"
+              aria-label="Upload image, PDF, DOCX, or video"
             />
 
             {file ? (
               <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <FileImage size={18} className="text-ink-600" />
+                {videoFile ? (
+                  <Film size={18} className="text-ink-600" />
+                ) : (
+                  <FileImage size={18} className="text-ink-600" />
+                )}
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-medium text-slate-700">
                     {file.name}
                   </p>
                   <p className="text-xs text-slate-400">
-                    {(file.size / 1024 / 1024).toFixed(2)} MB · Ready to submit
+                    {(file.size / 1024 / 1024).toFixed(2)} MB ·{" "}
+                    {videoFile
+                      ? formatDuration(videoDuration)
+                        : isDocxFile(file)
+                          ? "DOCX · Ready to extract and submit"
+                          : "Ready to submit"}
                   </p>
                 </div>
                 <button
@@ -537,14 +673,64 @@ export default function ContentReviewPage() {
                 className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 px-4 py-4 text-sm text-slate-500 hover:border-ink-400 hover:bg-ink-50/40"
               >
                 <FileImage size={17} />
-                Upload visual content
+                Upload visual, document, or video content
                 <span className="text-xs text-slate-400">
-                  PNG, JPG, WEBP, PDF · up to 10 MB
+                  Images/PDF/DOCX up to 10 MB · MP4/MOV/WEBM up to 50 MB
                 </span>
               </button>
             )}
 
-            {file && file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf") && (
+            {videoFile && videoPreviewUrl && (
+              <div className="mt-3 overflow-hidden rounded-lg border border-slate-200 bg-slate-950">
+                <video
+                  className="max-h-72 w-full"
+                  controls
+                  preload="metadata"
+                  src={videoPreviewUrl}
+                  onLoadedMetadata={(event) =>
+                    setVideoDuration(event.currentTarget.duration)
+                  }
+                  onError={() =>
+                    setFileError("The selected video could not be previewed; it may be corrupted or unsupported.")
+                  }
+                >
+                  Your browser cannot preview this video.
+                </video>
+              </div>
+            )}
+
+            {videoFile && videoTranscriptionConfigured && (
+              <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+                <input
+                  className="mt-1 h-4 w-4 accent-ink-700"
+                  type="checkbox"
+                  checked={allowExternalTranscription}
+                  onChange={(event) =>
+                    setAllowExternalTranscription(event.target.checked)
+                  }
+                />
+                <span>
+                  <strong>Send extracted audio for transcription</strong>
+                  <span className="mt-1 block text-xs leading-5">
+                    The audio track will be sent to the workspace-configured
+                    speech-to-text service. This is an external disclosure;
+                    select only when permitted. Without consent, audio is not
+                    sent and transcript-based findings are unavailable.
+                  </span>
+                </span>
+              </label>
+            )}
+
+            {videoFile && !videoTranscriptionConfigured && (
+              <p className="mt-3 rounded-lg bg-slate-50 p-3 text-xs leading-5 text-slate-600">
+                Speech transcription is not configured. No audio will be sent
+                to an external service. Local frame analysis will still run;
+                timestamped speech findings require a configured transcription
+                service.
+              </p>
+            )}
+
+            {file && !videoFile && !isDocxFile(file) && file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf") && (
               <div className="mt-3">
                 <label
                   className="mb-1.5 block text-sm font-medium text-slate-700"
@@ -569,7 +755,11 @@ export default function ContentReviewPage() {
             )}
 
             <p className="mt-2 text-xs leading-5 text-slate-400">
-              PDF pages are inspected individually. The uploaded file is stored privately with this review for authenticated reviewers. PDF page layout and vector artwork cannot be rendered by the current backend.
+              {videoFile
+                ? "Video is processed locally with FFmpeg using bounded frame and duration limits. The private source video is stored with this review for authorized members."
+                : isDocxFile(file)
+                  ? "DOCX paragraph and table text is extracted locally. The original document is stored privately with this review for authenticated members."
+                  : "PDF pages are inspected individually. Scanned-page OCR runs locally only when enabled and Tesseract is installed. Uploaded files are stored privately with this review for authenticated reviewers. PDF page layout and vector artwork are not visually analyzed."}
             </p>
           </div>
 
@@ -593,7 +783,9 @@ export default function ContentReviewPage() {
             {loading ? (
               <>
                 <LoaderCircle size={17} className="animate-spin" />
-                Analysing content…
+                {file && uploadProgress !== null && uploadProgress < 100
+                  ? `Uploading ${uploadProgress}%…`
+                  : "Analysing content…"}
               </>
             ) : (
               <>
@@ -604,12 +796,16 @@ export default function ContentReviewPage() {
           </button>
 
           {loading && (
-            <p
-              className="mt-3 text-center text-xs text-slate-400"
-              role="status"
-            >
-              Waiting for the analysis service. This may take a moment.
-            </p>
+            <div className="mt-3 text-center text-xs text-slate-400" role="status">
+              <p>
+                {uploadProgress !== null && uploadProgress < 100
+                  ? `Uploading file: ${uploadProgress}%`
+                  : "Waiting for analysis. Video processing may take a few minutes."}
+              </p>
+              {uploadProgress !== null && (
+                <progress className="mt-2 w-full" max="100" value={uploadProgress} />
+              )}
+            </div>
           )}
         </form>
 
@@ -727,6 +923,10 @@ export default function ContentReviewPage() {
                             "message"
                           ) || "Review this item against the applicable guideline."}
                         </p>
+
+                        <VisualPaletteComparison
+                          comparison={item.visual_data?.palette_comparison}
+                        />
 
                         {item.verification_status && (
                           <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3">
@@ -1095,7 +1295,11 @@ export default function ContentReviewPage() {
                         <div key={page.page_number} className="rounded-lg border border-slate-200 p-3">
                           <p className="text-xs font-semibold text-slate-700">
                             Page {page.page_number} · {page.images?.length || 0} embedded image(s)
-                            {page.text_layer_detected ? ` · ${page.text_characters || 0} extracted text characters` : " · no text layer"}
+                            {page.ocr_used
+                              ? ` · OCR extracted ${page.text_characters || 0} text characters`
+                              : page.text_layer_detected
+                                ? ` · ${page.text_characters || 0} digital text characters`
+                                : " · no text layer"}
                           </p>
                           {page.limitations?.map((limitation) => (
                             <p key={limitation} className="mt-1 text-xs text-amber-800">{limitation}</p>
@@ -1230,16 +1434,21 @@ export default function ContentReviewPage() {
                   )}
 
                   {result.image_analysis.palette_comparison && (
-                    <p
-                      className={`mt-3 text-xs font-medium ${result.image_analysis.palette_comparison.potential_mismatch
-                          ? "text-amber-700"
-                          : "text-emerald-700"
-                        }`}
-                    >
-                      {result.image_analysis.palette_comparison.potential_mismatch
-                        ? "Some image colours differ from the configured palette heuristic; check visually."
-                        : "Image colours are within the configured palette heuristic."}
-                    </p>
+                    <>
+                      <p
+                        className={`mt-3 text-xs font-medium ${result.image_analysis.palette_comparison.potential_mismatch
+                            ? "text-amber-700"
+                            : "text-emerald-700"
+                          }`}
+                      >
+                        {result.image_analysis.palette_comparison.potential_mismatch
+                          ? "Some image colours differ from the configured palette heuristic; check visually."
+                          : "Image colours are within the configured palette heuristic."}
+                      </p>
+                      <VisualPaletteComparison
+                        comparison={result.image_analysis.palette_comparison}
+                      />
+                    </>
                   )}
 
                   {result.image_analysis.limitations?.length > 0 && (

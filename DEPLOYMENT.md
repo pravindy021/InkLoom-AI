@@ -17,7 +17,8 @@ SQLite for persistent deployment.
 
 - The first Docker stage runs `npm ci` and `npm run build`.
 - The second stage installs `backend/requirements.txt`, copies the built
-  frontend to `backend/app/static`, and runs one Uvicorn process.
+  frontend to `backend/app/static`, installs FFmpeg/ffprobe, and runs one
+  Uvicorn process.
 - Uvicorn binds to `0.0.0.0` and uses Render's injected `PORT` (fallback
   `10000` for local Docker use).
 - FastAPI serves frontend assets and SPA routes. Unknown `/api`, health,
@@ -87,6 +88,20 @@ the application to run. Configure only providers you intentionally use, with
 their credentials entered as Render secrets. If SMTP is not configured, email
 invitation and password recovery features remain unavailable.
 
+Video uploads are limited by default to 50 MiB and 10 minutes, with up to 20
+frames extracted every 15 seconds. Adjust `MAX_VIDEO_UPLOAD_SIZE` (maximum
+200 MiB), `MAX_VIDEO_DURATION_SECONDS` (maximum 3,600),
+`VIDEO_FRAME_INTERVAL_SECONDS`, and `VIDEO_MAX_FRAMES` if needed. FFmpeg and
+ffprobe are included in the Docker image. Set
+`VIDEO_TRANSCRIPTION_API_URL`, optionally `VIDEO_TRANSCRIPTION_API_KEY`, and
+`VIDEO_TRANSCRIPTION_MODEL` only if an OpenAI-compatible speech-to-text
+endpoint is approved. A user must explicitly opt in for each video before
+audio is sent to that endpoint; it is not configured by default. Local frame
+analysis still runs without transcription. The Docker image includes
+Tesseract and enables local OCR for on-screen text and scanned PDF pages.
+Scanned-PDF rendering is bounded by `MAX_OCR_PAGES` (20 by default) and uses
+`pypdfium2` in memory without retaining rasterized page files.
+
 ## 3. Bootstrap the first Admin securely
 
 On startup, the app creates the configured Admin only if the database has no
@@ -147,11 +162,15 @@ After deployment, verify:
    login and logout both work over HTTPS.
 4. Admin, Reviewer, and Contributor API permissions remain enforced.
 5. Guideline, Brand Voice, evidence-source, analysis, review, and analytics
-   workflows respond successfully.
-6. An authorized review collaboration WebSocket connects through the same
+   workflows respond successfully. Verify role-authorized PDF/CSV reports.
+6. Upload a disposable MP4, MOV, or WEBM within configured size/duration
+   limits. Confirm the preview, extracted-frame findings and timestamps. If
+   transcription is configured, confirm consent is required before audio is
+   sent.
+7. An authorized review collaboration WebSocket connects through the same
    host. Collaboration presence is process-local; keep one service instance
    and one Uvicorn worker.
-7. Restart the service and confirm PostgreSQL data remains. Do not test this
+8. Restart the service and confirm PostgreSQL data remains. Do not test this
    by deleting or resetting the production database.
 
 ## Operational limitations
@@ -169,6 +188,6 @@ After deployment, verify:
   provide a retention policy or encryption-at-rest guarantee.
 - Real external LLM, email, and search behavior requires separately configured
   providers and credentials. Rule-based analysis is available without them.
-- OCR remains disabled by default. The image includes the Python OCR adapter
-  but not the system Tesseract executable; enabling `OCR_ENABLED` requires
-  extending the image with Tesseract.
+- OCR runs locally in the Docker image using Tesseract. Non-Docker local
+  environments can enable it with `OCR_ENABLED=true` after installing the
+  system Tesseract executable.

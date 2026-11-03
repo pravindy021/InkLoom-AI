@@ -17,6 +17,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app/backend
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+ENV OCR_ENABLED=true
 COPY backend/ ./
 COPY --from=frontend-build /app/frontend/dist ./app/static
 

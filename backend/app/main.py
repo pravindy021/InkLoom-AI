@@ -28,6 +28,7 @@ from app.database import (
     migrate_temporal_freshness,
     migrate_secure_publish,
     migrate_brand_voice,
+    migrate_visual_brand,
 )
 from app.models import BrandGuideline
 from app.routes import (
@@ -97,6 +98,7 @@ def create_app(
         migrate_temporal_freshness(database_engine)
         migrate_secure_publish(database_engine)
         migrate_brand_voice(database_engine)
+        migrate_visual_brand(database_engine)
         db = local_sessions()
         try:
             if db.query(BrandGuideline).count() == 0:

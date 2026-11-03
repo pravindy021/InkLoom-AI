@@ -48,6 +48,11 @@ def migrate_review_workflow(target_engine) -> None:
                 Integer(),
                 "REFERENCES users(id) ON DELETE SET NULL",
             ),
+            "archived_at": (DateTime(timezone=True), ""),
+            "archived_by_id": (
+                Integer(),
+                "REFERENCES users(id) ON DELETE SET NULL",
+            ),
             "submitted_by_id": (
                 Integer(),
                 "REFERENCES users(id) ON DELETE SET NULL",
@@ -318,6 +323,23 @@ def migrate_brand_voice(target_engine) -> None:
         tables=[
             BrandVoiceConfiguration.__table__,
             BrandVoiceVersion.__table__,
+        ],
+    )
+
+
+def migrate_visual_brand(target_engine) -> None:
+    if not inspect(target_engine).has_table("brand_guidelines"):
+        return
+    from app.models.visual_brand import (
+        VisualBrandConfiguration,
+        VisualBrandVersion,
+    )
+
+    Base.metadata.create_all(
+        bind=target_engine,
+        tables=[
+            VisualBrandConfiguration.__table__,
+            VisualBrandVersion.__table__,
         ],
     )
 

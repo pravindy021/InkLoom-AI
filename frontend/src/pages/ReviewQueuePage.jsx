@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowUpRight, Search } from "lucide-react";
+import { Archive, ArrowUpRight, Search } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { api, errorMessage, unwrapList } from "../services/api";
@@ -15,12 +15,14 @@ import {
   getReviewQueuePagination,
   updateReviewQueueState,
 } from "../utils/reviewQueue";
+import { canArchiveReview } from "../utils/reviewArchive";
 
 const PAGE_SIZE = 20;
 
 export default function ReviewQueuePage() {
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
+  const canArchive = canArchiveReview(user?.role);
   const [items, setItems] = useState([]);
   const [reviewers, setReviewers] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -33,6 +35,8 @@ export default function ReviewQueuePage() {
     page: 0,
   });
   const [assigning, setAssigning] = useState("");
+  const [archiving, setArchiving] = useState("");
+  const [archiveError, setArchiveError] = useState("");
 
   const load = async (active = () => true) => {
     setLoading(true);
@@ -119,6 +123,22 @@ export default function ReviewQueuePage() {
     }
   };
 
+  const archiveReview = async (item) => {
+    if (!window.confirm(
+      "Archive this review? It will leave the standard review queue, but its content, history, and attachments will be retained.",
+    )) return;
+    setArchiving(String(item.id));
+    setArchiveError("");
+    try {
+      await api.deleteReview(item.id);
+      await load();
+    } catch (e) {
+      setArchiveError(errorMessage(e));
+    } finally {
+      setArchiving("");
+    }
+  };
+
   return (
     <>
       <PageHeader
@@ -176,6 +196,11 @@ export default function ReviewQueuePage() {
         {assignmentError && (
           <p role="alert" className="border-b border-rose-100 px-5 py-2 text-sm text-rose-700">
             {assignmentError}
+          </p>
+        )}
+        {archiveError && (
+          <p role="alert" className="border-b border-rose-100 px-5 py-2 text-sm text-rose-700">
+            {archiveError}
           </p>
         )}
         {loading ? (
@@ -262,13 +287,27 @@ export default function ReviewQueuePage() {
                       <Badge tone="status">{item.status || "pending"}</Badge>
                     </td>
                     <td className="px-5 py-4">
-                      <Link
-                        aria-label={`Open ${item.title || "review"}`}
-                        to={`/reviews/${item.id}`}
-                        className="inline-flex rounded-lg p-2 text-slate-400 hover:bg-ink-50 hover:text-ink-700"
-                      >
-                        <ArrowUpRight size={17} />
-                      </Link>
+                      <div className="flex items-center gap-1">
+                        <Link
+                          aria-label={`Open ${item.title || "review"}`}
+                          to={`/reviews/${item.id}`}
+                          className="inline-flex rounded-lg p-2 text-slate-400 hover:bg-ink-50 hover:text-ink-700"
+                        >
+                          <ArrowUpRight size={17} />
+                        </Link>
+                        {canArchive && (
+                          <button
+                            className="inline-flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                            type="button"
+                            aria-label={`Archive review ${item.title || item.id}`}
+                            disabled={archiving === String(item.id)}
+                            onClick={() => archiveReview(item)}
+                          >
+                            <Archive size={15} />
+                            Archive
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}

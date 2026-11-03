@@ -6,10 +6,12 @@ InkLoom AI is a brand-governance workspace that reviews content against configur
 
 - Brand guideline management and review-specific guideline selection.
 - Content analysis for terminology, tone, promotional claims, factual claims, and supported image checks.
+- Video review for MP4, MOV, and WEBM uploads, including bounded frame extraction, local visual/OCR checks, and optional per-upload-consented speech transcription.
 - Approved evidence-source ingestion and review; pending or rejected sources are excluded from analysis.
 - Claim-level `verified`, `contradicted`, and `unverified` advisory statuses with evidence excerpts when available.
 - Optional OpenAI-compatible LLM analysis, embeddings, and consent-based external search; these providers are not required for local deterministic checks.
 - Human review queue, comments, revisions, approval decisions, activity history, and analytics.
+- Authorized review PDFs and date-filtered analytics PDF/CSV exports.
 - Admin, Reviewer, and Contributor roles, invite-only account activation, session cookies, and password recovery when SMTP is configured.
 - Explicit mock mode for UI development, visibly labeled and not suitable for a secured workspace.
 
@@ -75,6 +77,7 @@ npm run build
 - `verified` means a configured source matched the current heuristic. Review source scope, date, and context before publication.
 - External search is optional and only runs when configured and explicitly requested. Search snippets are candidate evidence, not proof.
 - Uploaded image checks use local visual heuristics; they do not constitute a trained visual brand-compliance model.
+- Video analysis requires FFmpeg/ffprobe. The deployment Docker image includes these and Tesseract; speech transcription is disabled unless an approved HTTPS provider is configured and the submitter explicitly consents. No video or extracted audio is sent to transcription by default.
 - Do not commit `.env` files, API keys, local database files, or real customer content.
 - Mock mode disables real authentication and role enforcement and must not be used for a secured demo or production deployment.
 - Before deployment, use HTTPS, set `AUTH_COOKIE_SECURE=true`, configure explicit trusted origins and secrets, and perform a deployment-specific security review.

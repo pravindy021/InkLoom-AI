@@ -2,16 +2,19 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
+  Archive,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Download,
   History,
+  LoaderCircle,
   MessageSquare,
   Radio,
   ShieldCheck,
   Send,
 } from "lucide-react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   API_BASE_URL,
   api,
@@ -27,6 +30,7 @@ import {
   PageHeader,
   SuccessMessage,
 } from "../components/common/UI";
+import VisualPaletteComparison from "../components/VisualPaletteComparison";
 import { useAuth } from "../contexts/AuthContext";
 import {
   applySuggestionToContent,
@@ -57,6 +61,8 @@ import {
   getBrandVoiceFindingLabel,
   getBrandVoiceFindings,
 } from "../utils/brandVoiceFindings";
+import { saveDownload } from "../utils/saveDownload";
+import { canArchiveReview } from "../utils/reviewArchive";
 
 function changedParts(before, after) {
   let start = 0;
@@ -103,6 +109,16 @@ function formatConfidence(value) {
   if (!Number.isFinite(number)) return null;
 
   return `${Math.round(number * 100)}%`;
+}
+
+function formatVideoTimestamp(value) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value) || 0));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 function EvidenceCitation({ source, claim, evidenceStatus }) {
@@ -252,8 +268,10 @@ export default function ReviewDetailPage() {
   const canDecide =
     user?.role === "admin" || user?.role === "reviewer";
   const isAdmin = user?.role === "admin";
+  const canArchive = canArchiveReview(user?.role);
 
   const { reviewId } = useParams();
+  const navigate = useNavigate();
 
   const [item, setItem] = useState(null);
   const [publishAssessment, setPublishAssessment] = useState(null);
@@ -277,6 +295,8 @@ export default function ReviewDetailPage() {
   const [versionComparison, setVersionComparison] = useState(null);
   const [versionComparisonError, setVersionComparisonError] = useState("");
   const [draftContent, setDraftContent] = useState("");
+  const [embeddingProviderConfigured, setEmbeddingProviderConfigured] = useState(false);
+  const [allowExternalAiProcessing, setAllowExternalAiProcessing] = useState(false);
   const [selectedFindingIndex, setSelectedFindingIndex] = useState(0);
   const [previewPage, setPreviewPage] = useState(1);
   const [severityFilter, setSeverityFilter] = useState("all");
@@ -295,12 +315,15 @@ export default function ReviewDetailPage() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [actionError, setActionError] = useState("");
+  const [reportLoading, setReportLoading] = useState(false);
+  const [archiveLoading, setArchiveLoading] = useState(false);
 
   const [activity, setActivity] = useState([]);
   const [activityError, setActivityError] = useState("");
   const [liveState, setLiveState] = useState("connecting");
 
   const socketRef = useRef(null);
+  const videoRef = useRef(null);
   const reconnectTimerRef = useRef(null);
   const draftTimerRef = useRef(null);
   const currentDraftRef = useRef(null);
@@ -440,6 +463,24 @@ export default function ReviewDetailPage() {
   useEffect(() => {
     load();
   }, [reviewId]);
+
+  useEffect(() => {
+    let active = true;
+    api.health()
+      .then((health) => {
+        if (active) {
+          setEmbeddingProviderConfigured(
+            Boolean(health?.embedding_model_configured),
+          );
+        }
+      })
+      .catch(() => {
+        if (active) setEmbeddingProviderConfigured(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isAdmin) return;
@@ -946,6 +987,42 @@ export default function ReviewDetailPage() {
     selectedMark?.scrollIntoView?.({ behavior: "smooth", block: "center" });
   }, [selectedFindingIndex, selectedVisibleIndex]);
 
+  const downloadReport = async () => {
+    setReportLoading(true);
+    setActionError("");
+    setNotice("");
+    try {
+      saveDownload(await api.downloadReviewReport(reviewId));
+      setNotice("Review PDF report downloaded.");
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
+  const archiveReview = async () => {
+    if (!window.confirm(
+      "Archive this review? It will leave the standard review queue, but its content, history, and attachments will be retained.",
+    )) return;
+    setArchiveLoading(true);
+    setActionError("");
+    try {
+      await api.deleteReview(reviewId);
+      navigate("/reviews");
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setArchiveLoading(false);
+    }
+  };
+
+  const seekVideo = (seconds) => {
+    if (!videoRef.current || !Number.isFinite(Number(seconds))) return;
+    videoRef.current.currentTime = Math.max(0, Number(seconds));
+    videoRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
   const saveRevision = async (event) => {
     event.preventDefault();
 
@@ -959,6 +1036,7 @@ export default function ReviewDetailPage() {
       const response = await api.reanalyze(reviewId, {
         content: draftContent.trim(),
         title: `Revision ${revisions.length + 1}`,
+        allow_external_ai_processing: allowExternalAiProcessing,
       });
 
       setItem(response?.data || response);
@@ -971,13 +1049,13 @@ export default function ReviewDetailPage() {
       setNotice(
         "Revision saved and deterministic checks rerun. Human review is required again."
       );
-
       await load();
       refreshActivity();
     } catch (e) {
       setActionError(errorMessage(e));
     } finally {
       setBusy(false);
+      setAllowExternalAiProcessing(false);
     }
   };
 
@@ -1092,6 +1170,30 @@ export default function ReviewDetailPage() {
         }`}
         action={
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              className="btn-secondary"
+              type="button"
+              onClick={downloadReport}
+              disabled={reportLoading}
+            >
+              {reportLoading ? (
+                <LoaderCircle className="animate-spin" size={16} />
+              ) : (
+                <Download size={16} />
+              )}
+              {reportLoading ? "Preparing..." : "Download Review Report"}
+            </button>
+            {canArchive && (
+              <button
+                className="btn-secondary text-rose-700"
+                type="button"
+                onClick={archiveReview}
+                disabled={archiveLoading}
+              >
+                <Archive size={16} />
+                {archiveLoading ? "Archiving..." : "Archive review"}
+              </button>
+            )}
             <Badge tone="status">{item.status || "pending"}</Badge>
             {item.approval_bypasses?.some(
               (bypass) => bypass.version_id === item.current_version_id,
@@ -1197,7 +1299,24 @@ export default function ReviewDetailPage() {
               </div>
             )}
 
-            <div className="mt-3 flex items-center justify-between gap-3">
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+              {embeddingProviderConfigured && (
+                <label className="flex items-start gap-2 text-xs leading-5 text-amber-900">
+                  <input
+                    className="mt-1 h-4 w-4 accent-ink-700"
+                    type="checkbox"
+                    checked={allowExternalAiProcessing}
+                    onChange={(event) =>
+                      setAllowExternalAiProcessing(event.target.checked)
+                    }
+                  />
+                  <span>
+                    Allow this revision's excerpts and approved-source chunks
+                    to be sent to the configured embedding provider. Leave
+                    unchecked for local lexical retrieval.
+                  </span>
+                </label>
+              )}
               <span className="text-xs text-slate-400">
                 {draftContent.length.toLocaleString()} characters ·
                 current findings refresh after re-analysis
@@ -1532,6 +1651,18 @@ export default function ReviewDetailPage() {
                             : finding.verification_status}
                         </Badge>
                       )}
+                      {finding.visual_data?.timestamp_seconds != null && (
+                        <button
+                          className="btn-secondary !px-2.5 !py-1.5 !text-xs"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            seekVideo(finding.visual_data.timestamp_seconds);
+                          }}
+                        >
+                          At {formatVideoTimestamp(finding.visual_data.timestamp_seconds)}
+                        </button>
+                      )}
                     </div>
 
                     {finding.visual_data && (
@@ -1609,6 +1740,9 @@ export default function ReviewDetailPage() {
                         {finding.visual_data.confidence != null && (
                           <p className="mt-1">Detection confidence: {formatConfidence(finding.visual_data.confidence)}</p>
                         )}
+                        <VisualPaletteComparison
+                          comparison={finding.visual_data.palette_comparison}
+                        />
                       </div>
                     )}
 
@@ -1770,7 +1904,115 @@ export default function ReviewDetailPage() {
                   Private review attachment · {item.visual_attachment.filename}
                 </p>
               </div>
-              {item.visual_attachment.media_type === "application/pdf" ? (
+              {item.visual_attachment.media_type?.startsWith("video/") ? (
+                <div className="p-4">
+                  <video
+                    ref={videoRef}
+                    className="max-h-[28rem] w-full rounded-lg bg-black"
+                    controls
+                    preload="metadata"
+                    src={`${API_BASE_URL}${item.visual_attachment.url}`}
+                    poster={
+                      item.visual_attachment.analysis?.video?.frames?.[0]?.url
+                        ? `${API_BASE_URL}${item.visual_attachment.analysis.video.frames[0].url}`
+                        : undefined
+                    }
+                  >
+                    Your browser does not support video playback.
+                  </video>
+                  <p className="mt-2 text-xs text-slate-500">
+                    Duration: {formatVideoTimestamp(
+                      item.visual_attachment.analysis?.video?.duration_seconds || 0,
+                    )}
+                  </p>
+                  {item.visual_attachment.analysis?.video?.warnings?.map((warning) => (
+                    <p className="mt-2 text-sm text-amber-800" key={warning}>
+                      {warning}
+                    </p>
+                  ))}
+                  {item.visual_attachment.analysis?.video?.transcript?.segments?.length > 0 && (
+                    <div className="mt-4">
+                      <h3 className="text-sm font-semibold text-slate-800">
+                        Timestamped transcript
+                      </h3>
+                      <ul className="mt-2 max-h-52 space-y-2 overflow-auto">
+                        {item.visual_attachment.analysis.video.transcript.segments.map((segment, index) => (
+                          <li className="flex gap-2 text-sm" key={`${segment.start}-${index}`}>
+                            <button
+                              className="shrink-0 font-medium text-ink-700 underline"
+                              type="button"
+                              onClick={() => seekVideo(segment.start)}
+                            >
+                              {formatVideoTimestamp(segment.start)}
+                            </button>
+                            <span className="whitespace-pre-wrap">{segment.text}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {!item.visual_attachment.analysis?.video?.transcript?.segments?.length &&
+                    item.visual_attachment.analysis?.video?.transcript?.text && (
+                      <div className="mt-4">
+                        <h3 className="text-sm font-semibold text-slate-800">
+                          Transcript
+                        </h3>
+                        <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">
+                          {item.visual_attachment.analysis.video.transcript.text}
+                        </p>
+                      </div>
+                    )}
+                  {item.visual_attachment.analysis?.video?.frames?.length > 0 && (
+                    <div className="mt-4">
+                      <h3 className="text-sm font-semibold text-slate-800">
+                        Extracted frames
+                      </h3>
+                      <div className="mt-2 grid grid-cols-2 gap-3">
+                        {item.visual_attachment.analysis.video.frames.map((frame) => (
+                          <div
+                            className="overflow-hidden rounded-lg border border-slate-200"
+                            key={frame.frame_index}
+                          >
+                            <button
+                              className="block w-full text-left"
+                              type="button"
+                              onClick={() => seekVideo(frame.timestamp_seconds)}
+                            >
+                              <img
+                                alt={`Video frame at ${formatVideoTimestamp(frame.timestamp_seconds)}`}
+                                className="aspect-video w-full object-cover"
+                                loading="lazy"
+                                src={`${API_BASE_URL}${frame.url}`}
+                              />
+                              <span className="block p-2 text-xs text-slate-600">
+                                {formatVideoTimestamp(frame.timestamp_seconds)}
+                              </span>
+                            </button>
+                            <div className="px-2 pb-2">
+                              <VisualPaletteComparison
+                                comparison={frame.analysis?.palette_comparison}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : item.visual_attachment.media_type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ? (
+                <div className="p-5">
+                  <p className="text-sm text-slate-600">
+                    Document text was extracted for analysis. Download the private original to review its formatting and context.
+                  </p>
+                  <a
+                    className="btn-secondary mt-3 inline-flex"
+                    href={`${API_BASE_URL}${item.visual_attachment.url}`}
+                    download
+                  >
+                    Download original DOCX
+                  </a>
+                </div>
+              ) : item.visual_attachment.media_type === "application/pdf" ? (
                 <>
                   {item.visual_attachment.analysis?.pages?.length > 1 && (
                     <div className="flex flex-wrap gap-2 border-b border-slate-100 p-3">
@@ -1793,6 +2035,33 @@ export default function ReviewDetailPage() {
                     src={`${API_BASE_URL}${item.visual_attachment.url}#page=${activeVisualPage}`}
                     className="h-[28rem] w-full"
                   />
+                  {item.visual_attachment.analysis?.pages?.length > 0 && (
+                    <div className="space-y-2 border-t border-slate-100 p-4">
+                      {item.visual_attachment.analysis.pages.map((page) => (
+                        <div
+                          className="rounded-lg border border-slate-200 p-3"
+                          key={page.page_number}
+                        >
+                          <p className="text-xs font-semibold text-slate-700">
+                            Page {page.page_number}
+                            {page.ocr_used
+                              ? ` · local OCR extracted ${page.text_characters || 0} characters`
+                              : page.text_layer_detected
+                                ? ` · ${page.text_characters || 0} digital text characters`
+                                : " · no text layer detected"}
+                          </p>
+                          {page.limitations?.map((limitation) => (
+                            <p
+                              className="mt-1 text-xs text-amber-800"
+                              key={limitation}
+                            >
+                              {limitation}
+                            </p>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </>
               ) : (
                 <div

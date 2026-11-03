@@ -1,16 +1,16 @@
 
-import { mockApi } from "./mockApi";
+import { mockApi } from "./mockApi.js";
 
-const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL;
+const configuredApiBaseUrl = import.meta.env?.VITE_API_BASE_URL;
 export const API_BASE_URL = (
   configuredApiBaseUrl !== undefined
     ? configuredApiBaseUrl
-    : import.meta.env.PROD
+    : import.meta.env?.PROD
       ? ""
       : "http://localhost:8000"
 ).replace(/\/$/, "");
 
-export const MOCK_MODE = import.meta.env.VITE_MOCK_API === "true";
+export const MOCK_MODE = import.meta.env?.VITE_MOCK_API === "true";
 
 async function request(path, options = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -51,6 +51,78 @@ async function request(path, options = {}) {
   return data;
 }
 
+function upload(path, formData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE_URL}${path}`);
+    xhr.withCredentials = true;
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable && typeof onProgress === "function") {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    });
+    xhr.addEventListener("error", () => reject(new Error("Network error while uploading the file.")));
+    xhr.addEventListener("load", () => {
+      let data;
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        data = xhr.responseText;
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const detail =
+          data && typeof data === "object"
+            ? data.detail || data.message
+            : data;
+        if (xhr.status === 401) {
+          window.dispatchEvent(new Event("inkloom:unauthorized"));
+        }
+        const error = new Error(
+          typeof detail === "string"
+            ? detail
+            : detail?.message || `Request failed (${xhr.status})`,
+        );
+        error.status = xhr.status;
+        error.detail = detail;
+        reject(error);
+        return;
+      }
+      resolve(data);
+    });
+    xhr.send(formData);
+  });
+}
+
+export async function downloadFile(path, fallbackName) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    credentials: "include",
+  });
+  if (!response.ok) {
+    const raw = await response.text();
+    let data;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = raw;
+    }
+    const detail =
+      data && typeof data === "object"
+        ? data.detail || data.message
+        : data;
+    if (response.status === 401) {
+      window.dispatchEvent(new Event("inkloom:unauthorized"));
+    }
+    throw new Error(
+      typeof detail === "string"
+        ? detail
+        : detail?.message || `Download failed (${response.status})`,
+    );
+  }
+  const disposition = response.headers.get("content-disposition") || "";
+  const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || fallbackName;
+  return { blob: await response.blob(), filename };
+}
+
 const json = (method, body) => ({
   method,
   headers: {
@@ -58,6 +130,8 @@ const json = (method, body) => ({
   },
   body: JSON.stringify(body),
 });
+
+const hasExplicitRemoteAiConsent = (value) => value === true;
 
 const realApi = {
   authMe: () => request("/api/auth/me"),
@@ -130,6 +204,15 @@ const realApi = {
 
   brandVoiceVersions: () =>
     request("/api/guidelines/brand-voice/versions"),
+
+  visualBrandPalette: () =>
+    request("/api/guidelines/visual-brand"),
+
+  updateVisualBrandPalette: (data) =>
+    request("/api/guidelines/visual-brand", json("PUT", data)),
+
+  visualBrandPaletteVersions: () =>
+    request("/api/guidelines/visual-brand/versions"),
 
   createGuideline: (data) =>
     request("/api/guidelines", json("POST", data)),
@@ -263,6 +346,14 @@ const realApi = {
           "allow_external_verification",
           String(Boolean(data.allow_external_verification))
         );
+        form.append(
+          "allow_external_transcription",
+          String(Boolean(data.allow_external_transcription)),
+        );
+        form.append(
+          "allow_external_ai_processing",
+          String(hasExplicitRemoteAiConsent(data.allow_external_ai_processing)),
+        );
 
         form.append("file", data.file);
 
@@ -280,10 +371,7 @@ const realApi = {
           );
         }
 
-        return request("/api/analyze", {
-          method: "POST",
-          body: form,
-        });
+        return upload("/api/analyze", form, data.onUploadProgress);
       })()
       : request(
         "/api/analyze",
@@ -296,6 +384,9 @@ const realApi = {
           alt_text: data.alt_text || "",
           allow_external_verification: Boolean(
             data.allow_external_verification
+          ),
+          allow_external_ai_processing: hasExplicitRemoteAiConsent(
+            data.allow_external_ai_processing,
           ),
         })
       ),
@@ -368,6 +459,15 @@ const realApi = {
   review: (id) =>
     request(`/api/reviews/${encodeURIComponent(id)}`),
 
+  deleteReview: (id) =>
+    request(`/api/reviews/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  downloadReviewReport: (id) =>
+    downloadFile(
+      `/api/reviews/${encodeURIComponent(id)}/report.pdf`,
+      `inkloom-review-${id}.pdf`,
+    ),
+
   // The backend accepts the earlier conflict-specific key for compatibility.
   updateStatus: (id, status, acknowledgeWarnings = false, reason = "") =>
     request(
@@ -398,7 +498,12 @@ const realApi = {
   reanalyze: (id, revision) =>
     request(
       `/api/reviews/${encodeURIComponent(id)}/reanalyze`,
-      json("POST", revision)
+      json("POST", {
+        ...revision,
+        allow_external_ai_processing: hasExplicitRemoteAiConsent(
+          revision.allow_external_ai_processing,
+        ),
+      })
     ),
 
   analytics: (startDate, endDate) => {
@@ -416,6 +521,28 @@ const realApi = {
     const query = params.toString();
     return request(
       `/api/analytics/guideline-blind-spots${query ? `?${query}` : ""}`,
+    );
+  },
+
+  governanceInsights: (startDate, endDate) => {
+    const params = new URLSearchParams();
+    if (startDate) params.set("start_date", startDate);
+    if (endDate) params.set("end_date", endDate);
+    const query = params.toString();
+    return request(
+      `/api/analytics/governance-insights${query ? `?${query}` : ""}`,
+    );
+  },
+
+  downloadAnalyticsReport: (format, startDate, endDate) => {
+    const params = new URLSearchParams();
+    if (startDate) params.set("start_date", startDate);
+    if (endDate) params.set("end_date", endDate);
+    const query = params.toString();
+    const path = `/api/analytics/${format === "csv" ? "export.csv" : "report.pdf"}${query ? `?${query}` : ""}`;
+    return downloadFile(
+      path,
+      `inkloom-analytics.${format === "csv" ? "csv" : "pdf"}`,
     );
   },
 };

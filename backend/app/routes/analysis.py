@@ -4,15 +4,18 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
 
 from app.config import (
+    EMBEDDINGS_ENABLED,
     FACT_CHECK_ENABLED,
     FACT_CHECK_PROVIDER,
     MAX_CONTENT_LENGTH,
     MAX_UPLOAD_SIZE,
+    MAX_VIDEO_UPLOAD_SIZE,
     TRUSTED_SOURCE_DOMAINS,
 )
 from app.database import get_db
@@ -20,7 +23,11 @@ from app.models.brand_guideline import BrandGuideline
 from app.models.brand_voice import BrandVoiceConfiguration
 from app.models.content_review import ContentReview, ReviewAnalysisRun, ReviewFinding
 from app.models.source_document import SourceDocument
-from app.models.visual_asset import ReviewVisualAttachment, VisualAsset
+from app.models.visual_asset import (
+    ReviewVideoFrame,
+    ReviewVisualAttachment,
+    VisualAsset,
+)
 from app.models.user import User
 from app.schemas.analysis import AnalysisRequest
 from app.services.activity_service import record_activity
@@ -31,6 +38,7 @@ from app.services.visual_analysis import (
     analyze_visual_file,
     visual_analysis_summary,
 )
+from app.services.visual_palette import resolve_visual_palette
 from app.services.review_service import finding_payload
 from app.services.claim_checker import check_promotional_claims, factual_claim_excerpts
 from app.services.factual_verifier import (
@@ -46,12 +54,140 @@ from app.services.source_retrieval import (
     retrieval_method,
 )
 from app.services.source_access import apply_source_visibility
+from app.services.document_ingestion import DOCX_MEDIA_TYPE, extract_docx_text
+from app.services.accessibility_analyzer import analyze_docx_accessibility
 from app.services.llm_analyzer import LLMProviderError, analyze_with_llm, llm_enabled
 from app.services.text_analyzer import analyze_text
 from app.services.auth_service import require_roles
+from app.services.video_processing import (
+    VideoProcessingConfigurationError,
+    VideoProcessingError,
+    process_video_upload,
+)
 
 router = APIRouter(prefix="/api", tags=["analysis"])
 MAX_LOCAL_CLAIMS = 20
+
+
+async def _parse_multipart_form(form):
+    image_bytes: Optional[bytes] = None
+    pdf_upload = False
+    document_bytes: Optional[bytes] = None
+    document_info: Optional[dict] = None
+    video_bytes: Optional[bytes] = None
+    video_processing: Optional[dict] = None
+    visual_filename: Optional[str] = None
+    visual_media_type: Optional[str] = None
+    raw_guideline_ids = form.get("guideline_ids", "[]")
+    guideline_ids = _parse_id_list(raw_guideline_ids, "guideline_ids")
+    payload = {
+        "title": form.get("title"),
+        "content": form.get("content", ""),
+        "content_type": form.get("content_type") or "text",
+        "guideline_ids": guideline_ids or [],
+        "source_ids": _parse_id_list(form.get("source_ids", "[]"), "source_ids"),
+        "alt_text": form.get("alt_text"),
+        "allow_external_verification": form.get("allow_external_verification", "false"),
+        "allow_external_ai_processing": (
+            str(form.get("allow_external_ai_processing", "false")).lower()
+            == "true"
+        ),
+    }
+    uploaded = form.get("file")
+    if uploaded is not None:
+        if not isinstance(uploaded, UploadFile):
+            raise HTTPException(
+                status_code=422,
+                detail="file must be an uploaded image, PDF, DOCX, or video.",
+            )
+        filename = uploaded.filename or ""
+        extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if extension in {"mp4", "mov", "webm"}:
+            if uploaded.size is not None and uploaded.size > MAX_VIDEO_UPLOAD_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Video exceeds the configured maximum upload size.",
+                )
+            try:
+                video_bytes, video_processing = await process_video_upload(
+                    uploaded,
+                    str(form.get("allow_external_transcription", "false")).lower()
+                    == "true",
+                )
+            except VideoProcessingConfigurationError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            except VideoProcessingError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            visual_filename = filename
+            visual_media_type = uploaded.content_type
+        elif extension == "docx":
+            if uploaded.size is not None and uploaded.size > MAX_UPLOAD_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Document exceeds the configured maximum upload size.",
+                )
+            document_bytes = await uploaded.read(MAX_UPLOAD_SIZE + 1)
+            if len(document_bytes) > MAX_UPLOAD_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Document exceeds the configured maximum upload size.",
+                )
+            try:
+                document_text = extract_docx_text(
+                    filename,
+                    document_bytes,
+                    uploaded.content_type,
+                    MAX_UPLOAD_SIZE,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            existing_content = str(payload.get("content") or "").strip()
+            payload["content"] = "\n\n".join(
+                part for part in (existing_content, document_text) if part
+            )
+            if len(payload["content"].encode("utf-8")) > MAX_CONTENT_LENGTH:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Extracted document text exceeds the configured maximum content length.",
+                )
+            document_info = {
+                "format": "docx",
+                "extracted_characters": len(document_text),
+                "detection_method": "python-docx paragraph and table text extraction",
+            }
+            visual_filename = filename
+            visual_media_type = DOCX_MEDIA_TYPE
+        else:
+            pdf_upload = extension == "pdf"
+            if uploaded.size is not None and uploaded.size > MAX_UPLOAD_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Image or PDF exceeds the configured maximum upload size.",
+                )
+            image_bytes = await uploaded.read(MAX_UPLOAD_SIZE + 1)
+            if len(image_bytes) > MAX_UPLOAD_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Image or PDF exceeds the configured maximum upload size.",
+                )
+            if not image_bytes:
+                raise HTTPException(
+                    status_code=400, detail="Uploaded visual file is empty."
+                )
+            visual_filename = filename
+            visual_media_type = uploaded.content_type
+
+    return (
+        payload,
+        image_bytes,
+        visual_filename,
+        visual_media_type,
+        video_bytes,
+        video_processing,
+        document_bytes,
+        document_info,
+        pdf_upload,
+    )
 
 
 async def _parse_request(request: Request):
@@ -65,12 +201,19 @@ async def _parse_request(request: Request):
         maximum_request_length = (
             MAX_CONTENT_LENGTH + 16_384
             if "application/json" in content_type
-            else MAX_CONTENT_LENGTH + MAX_UPLOAD_SIZE + 262_144
+            else MAX_CONTENT_LENGTH
+            + max(MAX_UPLOAD_SIZE, MAX_VIDEO_UPLOAD_SIZE)
+            + 262_144
         )
         if request_length > maximum_request_length:
             raise HTTPException(status_code=413, detail="Request exceeds the configured size limit.")
 
     image_bytes: Optional[bytes] = None
+    pdf_upload = False
+    document_bytes: Optional[bytes] = None
+    document_info: Optional[dict] = None
+    video_bytes: Optional[bytes] = None
+    video_processing: Optional[dict] = None
     visual_filename: Optional[str] = None
     visual_media_type: Optional[str] = None
     if "application/json" in content_type:
@@ -86,36 +229,20 @@ async def _parse_request(request: Request):
             form = await request.form()
         except (MultiPartException, ValueError, OSError):
             raise HTTPException(status_code=400, detail="Could not parse multipart form data.")
-        raw_guideline_ids = form.get("guideline_ids", "[]")
-        guideline_ids = _parse_id_list(raw_guideline_ids, "guideline_ids")
-        payload = {
-            "title": form.get("title"),
-            "content": form.get("content", ""),
-            "content_type": form.get("content_type") or "text",
-            "guideline_ids": guideline_ids or [],
-            "source_ids": _parse_id_list(form.get("source_ids", "[]"), "source_ids"),
-            "alt_text": form.get("alt_text"),
-            "allow_external_verification": form.get("allow_external_verification", "false"),
-        }
-        uploaded = form.get("file")
-        if uploaded is not None:
-            if not isinstance(uploaded, UploadFile):
-                raise HTTPException(status_code=422, detail="file must be an uploaded image or PDF.")
-            if uploaded.size is not None and uploaded.size > MAX_UPLOAD_SIZE:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Image or PDF exceeds the configured maximum upload size.",
-                )
-            image_bytes = await uploaded.read(MAX_UPLOAD_SIZE + 1)
-            if len(image_bytes) > MAX_UPLOAD_SIZE:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Image or PDF exceeds the configured maximum upload size.",
-                )
-            if not image_bytes:
-                raise HTTPException(status_code=400, detail="Uploaded visual file is empty.")
-            visual_filename = uploaded.filename or ""
-            visual_media_type = uploaded.content_type
+        try:
+            (
+                payload,
+                image_bytes,
+                visual_filename,
+                visual_media_type,
+                video_bytes,
+                video_processing,
+                document_bytes,
+                document_info,
+                pdf_upload,
+            ) = await _parse_multipart_form(form)
+        finally:
+            await form.close()
     else:
         raise HTTPException(
             status_code=415,
@@ -127,11 +254,30 @@ async def _parse_request(request: Request):
             status_code=413,
             detail="Content exceeds the configured maximum length.",
         )
+    if (
+        not str(payload.get("content", "")).strip()
+        and video_bytes is None
+        and not pdf_upload
+        and document_bytes is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Content cannot be blank unless a video is uploaded.",
+        )
     try:
         validated = AnalysisRequest.model_validate(payload)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors(include_context=False))
-    return validated, image_bytes, visual_filename, visual_media_type
+    return (
+        validated,
+        image_bytes,
+        visual_filename,
+        visual_media_type,
+        video_bytes,
+        video_processing,
+        document_bytes,
+        document_info,
+    )
 
 
 def _parse_id_list(value, field_name: str):
@@ -152,7 +298,16 @@ async def analyze_content(
     db: Session = Depends(get_db),
     analyst: User = Depends(require_roles("admin", "reviewer", "contributor")),
 ):
-    payload, image_bytes, visual_filename, visual_media_type = await _parse_request(request)
+    (
+        payload,
+        image_bytes,
+        visual_filename,
+        visual_media_type,
+        video_bytes,
+        video_processing,
+        document_bytes,
+        document_info,
+    ) = await _parse_request(request)
     if payload.guideline_ids:
         guidelines = (
             db.query(BrandGuideline)
@@ -203,7 +358,17 @@ async def analyze_content(
     approved_logo_assets = []
     image_info = None
     visual_findings = []
-    if image_bytes is not None:
+    resolved_visual_palette = None
+    if image_bytes is not None or video_bytes is not None:
+        try:
+            resolved_visual_palette = resolve_visual_palette(db, guidelines)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail="Visual brand palette settings are temporarily unavailable.",
+            ) from exc
+    if image_bytes is not None or video_bytes is not None:
         today = date.today()
         approved_logo_assets = [
             {
@@ -231,6 +396,8 @@ async def analyze_content(
                 .all()
             )
         ]
+
+    if image_bytes is not None:
         try:
             image_info, visual_findings = analyze_visual_file(
                 visual_filename or "",
@@ -238,13 +405,68 @@ async def analyze_content(
                 image_bytes,
                 guidelines,
                 approved_logo_assets,
+                resolved_palette=resolved_visual_palette,
             )
         except ImageAnalysisConfigurationError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    video_info = None
     extracted_visual_text = []
+    video_text_segments = []
+    if video_bytes is not None and video_processing is not None:
+        frame_summaries = []
+        for frame in video_processing["frames"]:
+            try:
+                frame_info, frame_findings = analyze_visual_file(
+                    "frame-{}.jpg".format(frame["frame_index"]),
+                    "image/jpeg",
+                    frame["file_data"],
+                    guidelines,
+                    approved_logo_assets,
+                    resolved_palette=resolved_visual_palette,
+                )
+            except ImageAnalysisConfigurationError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            for finding in frame_findings:
+                finding.setdefault("visual_data", {}).update(
+                    {
+                        "timestamp_seconds": frame["timestamp_seconds"],
+                        "frame_index": frame["frame_index"],
+                    }
+                )
+            visual_findings.extend(frame_findings)
+            frame_text = str(frame_info.get("extracted_text") or "").strip()
+            if frame_text:
+                extracted_visual_text.append(frame_text)
+                video_text_segments.append(
+                    {
+                        "start": frame["timestamp_seconds"],
+                        "frame_index": frame["frame_index"],
+                        "text": frame_text,
+                    }
+                )
+            frame_summaries.append(
+                {
+                    "frame_index": frame["frame_index"],
+                    "timestamp_seconds": frame["timestamp_seconds"],
+                    "analysis": visual_analysis_summary(frame_info),
+                    "file_data": frame["file_data"],
+                    "media_type": frame["media_type"],
+                }
+            )
+        video_info = {
+            "duration_seconds": video_processing["duration_seconds"],
+            "metadata": video_processing["metadata"],
+            "frame_interval_seconds": video_processing["frame_interval_seconds"],
+            "transcript": video_processing["transcript"],
+            "warnings": list(video_processing["warnings"]),
+            "frames": frame_summaries,
+        }
+
     page_texts = []
     if image_info:
         if image_info.get("format") == "pdf":
@@ -261,11 +483,57 @@ async def analyze_content(
                         )
         elif image_info.get("extracted_text"):
             extracted_visual_text.append(image_info["extracted_text"])
-    analysis_text = payload.content
-    if extracted_visual_text:
+    pdf_text_is_primary = False
+    if (
+        image_info
+        and image_info.get("format") == "pdf"
+        and not payload.content.strip()
+    ):
+        extracted_pdf_text = "\n".join(extracted_visual_text).strip()
+        if not extracted_pdf_text:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No readable text was extracted from the PDF. For scanned pages, "
+                    "enable OCR_ENABLED and install pypdfium2, pytesseract, and Tesseract."
+                ),
+            )
+        if len(extracted_pdf_text.encode("utf-8")) > MAX_CONTENT_LENGTH:
+            raise HTTPException(
+                status_code=413,
+                detail="Extracted PDF text exceeds the configured maximum content length.",
+            )
+        payload.content = extracted_pdf_text
+        pdf_text_is_primary = True
+    transcript = (video_info or {}).get("transcript") or {}
+    analysis_parts = [payload.content.strip(), str(transcript.get("text") or "").strip()]
+    analysis_text = "\n\n".join(part for part in analysis_parts if part)
+    if not analysis_text:
+        analysis_text = "Video submitted for review."
+    if extracted_visual_text and not pdf_text_is_primary:
         analysis_text = "{}\n{}".format(
             analysis_text, "\n".join(extracted_visual_text)
         )
+    provider_warnings = []
+    remote_ai_configured = llm_enabled() or EMBEDDINGS_ENABLED
+    if remote_ai_configured:
+        provider_warnings.append(
+            (
+                "Per-analysis consent was granted for configured remote AI/"
+                "embedding processing."
+            )
+            if payload.allow_external_ai_processing
+            else (
+                "Remote AI/embedding processing was not opted in; configured "
+                "LLM and embedding providers were not sent content."
+            )
+        )
+    if video_info:
+        provider_warnings.extend(video_info["warnings"])
+        if llm_enabled():
+            provider_warnings.append(
+                "The configured LLM was not sent video content. Transcript analysis uses local deterministic rules."
+            )
     claim_candidates = factual_claim_excerpts(analysis_text) + [
         str(item["matched_text"])
         for item in check_promotional_claims(analysis_text)
@@ -274,9 +542,12 @@ async def analyze_content(
     claim_candidates = list(dict.fromkeys(claim_candidates))
     evidence_by_claim = {}
     evidence_matches = []
-    evidence_retrieval_method = retrieval_method()
+    evidence_retrieval_method = (
+        retrieval_method()
+        if payload.allow_external_ai_processing
+        else "bm25_lexical"
+    )
     embedding_provider_failed = False
-    provider_warnings = []
     external_failure = False
     external_claims_searched = 0
     external_claims_attempted = 0
@@ -289,7 +560,7 @@ async def analyze_content(
         if embedding_provider_failed:
             local_matches = retrieve_lexical_evidence(claim, sources)
             evidence_retrieval_method = "bm25_lexical_fallback"
-        else:
+        elif payload.allow_external_ai_processing:
             try:
                 local_matches, evidence_retrieval_method = await retrieve_evidence(
                     claim, sources, db
@@ -303,6 +574,9 @@ async def analyze_content(
                 )
                 local_matches = retrieve_lexical_evidence(claim, sources)
                 evidence_retrieval_method = "bm25_lexical_fallback"
+        else:
+            local_matches = retrieve_lexical_evidence(claim, sources)
+            evidence_retrieval_method = "bm25_lexical"
         claim_evidence = list(local_matches)
         if (
             payload.allow_external_verification
@@ -350,6 +624,62 @@ async def analyze_content(
             brand_voice.configuration if brand_voice else None
         ),
     )
+    if document_bytes is not None and (document_info or {}).get("format") == "docx":
+        try:
+            document_accessibility_findings = analyze_docx_accessibility(
+                document_bytes
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        existing_link_evidence = {
+            str(item.get("matched_text") or "").strip().casefold()
+            for item in findings
+            if item.get("category") == "accessibility"
+            and item.get("matched_text")
+        }
+        findings.extend(
+            item
+            for item in document_accessibility_findings
+            if not (
+                item["title"] == "Link text is missing or unclear"
+                and str(item.get("matched_text") or "").strip().casefold()
+                in existing_link_evidence
+            )
+        )
+    if transcript.get("segments"):
+        for finding in findings:
+            matched = str(finding.get("matched_text") or "").casefold()
+            segment = next(
+                (
+                    item
+                    for item in transcript["segments"]
+                    if matched and matched in item["text"].casefold()
+                ),
+                None,
+            )
+            if segment:
+                finding.setdefault("visual_data", {})[
+                    "timestamp_seconds"
+                ] = segment["start"]
+    for finding in findings:
+        if finding.get("visual_data", {}).get("timestamp_seconds") is not None:
+            continue
+        matched = str(finding.get("matched_text") or "").casefold()
+        segment = next(
+            (
+                item
+                for item in video_text_segments
+                if matched and matched in item["text"].casefold()
+            ),
+            None,
+        )
+        if segment:
+            finding.setdefault("visual_data", {}).update(
+                {
+                    "timestamp_seconds": segment["start"],
+                    "frame_index": segment["frame_index"],
+                }
+            )
     for finding in findings:
         matched_text = finding.get("matched_text")
         if not isinstance(matched_text, str) or not matched_text:
@@ -385,7 +715,11 @@ async def analyze_content(
             finding["claim_end"] = None
 
     analysis_engine = "rules"
-    if llm_enabled():
+    if (
+        payload.allow_external_ai_processing
+        and llm_enabled()
+        and video_bytes is None
+    ):
         try:
             llm_findings = await analyze_with_llm(payload.content, guidelines, evidence_matches)
         except LLMProviderError as exc:
@@ -443,9 +777,16 @@ async def analyze_content(
         finding["explanation"] = "{} {}".format(
             finding["explanation"], verified["verification_explanation"]
         )
+    stored_content = payload.content.strip() or (
+        "Video submitted for review: {}".format(
+            visual_filename or "uploaded video"
+        )
+        if video_bytes is not None
+        else ""
+    )
     review = ContentReview(
         title=(payload.title or "").strip() or "Untitled content",
-        content=payload.content,
+        content=stored_content,
         content_type=payload.content_type,
         status="pending",
         guideline_ids=[item.id for item in guidelines],
@@ -469,6 +810,8 @@ async def analyze_content(
             "issue_count": len(findings),
             "analysis_engine": analysis_engine,
             "image_attached": image_bytes is not None,
+            "video_attached": video_bytes is not None,
+            "document_attached": document_bytes is not None,
         },
     )
     finding_models: List[ReviewFinding] = []
@@ -535,10 +878,55 @@ async def analyze_content(
                 uploaded_by_id=analyst.id,
             )
         )
+    elif video_bytes is not None and video_info is not None:
+        frames_for_storage = video_info.pop("frames")
+        video_info["frames"] = []
+        for frame in frames_for_storage:
+            frame_index = frame["frame_index"]
+            frame_data = frame.pop("file_data")
+            frame_media_type = frame.pop("media_type")
+            db.add(
+                ReviewVideoFrame(
+                    review_id=review.id,
+                    frame_index=frame_index,
+                    timestamp_seconds=frame["timestamp_seconds"],
+                    media_type=frame_media_type,
+                    file_data=frame_data,
+                )
+            )
+            video_info["frames"].append(
+                {
+                    **frame,
+                    "url": "/api/reviews/{}/video-frames/{}".format(
+                        review.id, frame_index
+                    ),
+                }
+            )
+        db.add(
+            ReviewVisualAttachment(
+                review_id=review.id,
+                filename=visual_filename or "video-upload",
+                media_type=visual_media_type or "application/octet-stream",
+                file_data=video_bytes,
+                analysis_metadata={"video": video_info},
+                uploaded_by_id=analyst.id,
+            )
+        )
+    elif document_bytes is not None and document_info is not None:
+        db.add(
+            ReviewVisualAttachment(
+                review_id=review.id,
+                filename="review-{}.docx".format(review.id),
+                media_type=DOCX_MEDIA_TYPE,
+                file_data=document_bytes,
+                analysis_metadata={"document": document_info},
+                uploaded_by_id=analyst.id,
+            )
+        )
     db.add(
         ReviewAnalysisRun(
             review_id=review.id,
-            content=payload.content,
+            content=analysis_text,
             findings=[finding_payload(item) for item in finding_models],
             analysis_engine=analysis_engine,
             evidence_retrieval_method=evidence_retrieval_method,
@@ -610,9 +998,13 @@ async def analyze_content(
         "analysis_engine": analysis_engine,
         "analyzed_at": datetime.now(timezone.utc),
         "image_analysis": image_info,
+        "video_analysis": video_info,
+        "document_analysis": document_info,
         "visual_attachment_url": (
             "/api/reviews/{}/visual-attachment".format(review.id)
             if image_bytes is not None
+            or video_bytes is not None
+            or document_bytes is not None
             else None
         ),
     }

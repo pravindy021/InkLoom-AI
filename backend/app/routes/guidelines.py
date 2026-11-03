@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -12,12 +12,14 @@ from app.models.brand_guideline import (
     GuidelineVersion,
 )
 from app.models.brand_voice import BrandVoiceConfiguration, BrandVoiceVersion
+from app.models.visual_brand import VisualBrandConfiguration, VisualBrandVersion
 from app.models.user import User
 from app.schemas.guidelines import (
     GuidelineCreate,
     GuidelineReviewRequest,
     GuidelineUpdate,
     BrandVoiceConfigurationUpdate,
+    VisualBrandPaletteUpdate,
 )
 from app.services.auth_service import require_roles
 from app.services.guideline_diagnostics import diagnose_guidelines
@@ -98,6 +100,43 @@ def serialize_brand_voice_configuration(item=None):
         "updated_by": item.updated_by.display_name if item.updated_by else None,
         "updated_at": normalize_utc(item.updated_at),
     }
+
+
+def _empty_visual_brand_palette():
+    return {
+        "primary": [],
+        "secondary": [],
+        "accent": [],
+        "version_number": 0,
+        "updated_by": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+def serialize_visual_brand_palette(item=None):
+    if item is None:
+        return _empty_visual_brand_palette()
+    return {
+        "primary": item.primary or [],
+        "secondary": item.secondary or [],
+        "accent": item.accent or [],
+        "version_number": item.version_number,
+        "updated_by": item.updated_by.display_name if item.updated_by else None,
+        "created_at": normalize_utc(item.created_at),
+        "updated_at": normalize_utc(item.updated_at),
+    }
+
+
+def _lock_visual_brand_configuration_updates(db: Session) -> None:
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": 1230382156},
+        )
+    elif dialect == "sqlite":
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
 
 
 @router.get("")
@@ -211,6 +250,97 @@ def list_brand_voice_versions(
     versions = (
         db.query(BrandVoiceVersion)
         .order_by(BrandVoiceVersion.version_number.desc())
+        .all()
+    )
+    return [
+        {
+            "id": version.id,
+            "version_number": version.version_number,
+            "snapshot": version.snapshot,
+            "editor_id": version.editor_id,
+            "editor": version.editor.display_name if version.editor else None,
+            "created_at": normalize_utc(version.created_at),
+        }
+        for version in versions
+    ]
+
+
+@router.get("/visual-brand")
+def get_visual_brand_palette(
+    db: Session = Depends(get_db),
+    _reader: User = Depends(
+        require_roles("admin", "reviewer", "contributor")
+    ),
+):
+    return serialize_visual_brand_palette(
+        db.get(VisualBrandConfiguration, 1)
+    )
+
+
+@router.put("/visual-brand")
+def update_visual_brand_palette(
+    payload: VisualBrandPaletteUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_roles("admin")),
+):
+    palette = payload.model_dump(mode="json")
+    try:
+        _lock_visual_brand_configuration_updates(db)
+        item = db.get(VisualBrandConfiguration, 1)
+        latest_version = (
+            db.query(VisualBrandVersion.version_number)
+            .order_by(VisualBrandVersion.version_number.desc())
+            .first()
+        )
+        if item is not None and {
+            "primary": item.primary or [],
+            "secondary": item.secondary or [],
+            "accent": item.accent or [],
+        } == palette:
+            current = serialize_visual_brand_palette(item)
+            db.rollback()
+            return current
+
+        version_number = (latest_version[0] if latest_version else 0) + 1
+        if item is None:
+            item = VisualBrandConfiguration(
+                id=1,
+                **palette,
+                version_number=version_number,
+                updated_by_id=admin.id,
+            )
+            db.add(item)
+        else:
+            item.primary = palette["primary"]
+            item.secondary = palette["secondary"]
+            item.accent = palette["accent"]
+            item.version_number = version_number
+            item.updated_by_id = admin.id
+        db.add(
+            VisualBrandVersion(
+                version_number=version_number,
+                snapshot=palette,
+                editor_id=admin.id,
+            )
+        )
+        db.commit()
+        db.refresh(item)
+        return serialize_visual_brand_palette(item)
+    except Exception:
+        db.rollback()
+        raise
+
+
+@router.get("/visual-brand/versions")
+def list_visual_brand_versions(
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles("admin")),
+):
+    versions = (
+        db.query(VisualBrandVersion)
+        .order_by(VisualBrandVersion.version_number.desc())
+        .limit(limit)
         .all()
     )
     return [

@@ -1,7 +1,6 @@
 from datetime import date
 from io import BytesIO
 from pathlib import PurePath
-import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from PIL import Image, UnidentifiedImageError
@@ -12,6 +11,12 @@ from app.config import MAX_IMAGE_PIXELS, MAX_UPLOAD_SIZE, OCR_ENABLED
 from app.services.image_analyzer import (
     ImageAnalysisConfigurationError,
     inspect_image,
+)
+from app.services.document_ingestion import extract_pdf_pages
+from app.services.visual_palette import (
+    guideline_palette_colors,
+    is_visual_category,
+    resolve_visual_palette,
 )
 
 MAX_PDF_PAGES = 100
@@ -24,50 +29,6 @@ _MIME_BY_FORMAT = {
     "JPEG": "image/jpeg",
     "WEBP": "image/webp",
 }
-_HEX_COLOR = re.compile(r"(?<![0-9A-Fa-f])#?([0-9A-Fa-f]{6})(?![0-9A-Fa-f])")
-_VISUAL_CATEGORIES = {
-    "visual",
-    "visual_brand",
-    "visual_identity",
-    "brand_color",
-    "brand_colour",
-    "brand_colors",
-    "brand_colours",
-    "logo",
-    "accessibility",
-}
-
-
-def _normalized_category(value: Optional[str]) -> str:
-    return (value or "").strip().lower().replace("-", "_").replace(" ", "_")
-
-
-def _guideline_colors(guidelines) -> List[Dict[str, Any]]:
-    colors = []
-    for guideline in guidelines:
-        category = _normalized_category(guideline.category)
-        if category not in _VISUAL_CATEGORIES:
-            continue
-        text = " ".join(
-            [
-                guideline.name or "",
-                guideline.description or "",
-                " ".join(guideline.examples or []),
-            ]
-        )
-        for match in _HEX_COLOR.finditer(text):
-            color = "#" + match.group(1).upper()
-            if not any(item["color"] == color for item in colors):
-                colors.append(
-                    {
-                        "color": color,
-                        "guideline_id": guideline.id,
-                        "guideline": guideline.name,
-                    }
-                )
-    return colors
-
-
 def _validate_image_bytes(image_bytes: bytes) -> Tuple[str, int, int]:
     try:
         with Image.open(BytesIO(image_bytes)) as image:
@@ -143,9 +104,9 @@ def _image_findings(
     visual_guidelines = [
         item
         for item in guidelines
-        if _normalized_category(item.category) in _VISUAL_CATEGORIES
+        if is_visual_category(item.category)
     ]
-    guide_colors = _guideline_colors(visual_guidelines)
+    guide_colors = guideline_palette_colors(visual_guidelines)
     expected_colors = [item["color"] for item in guide_colors]
     palette = image_info.get("palette_comparison")
 
@@ -214,18 +175,51 @@ def _image_findings(
                 ),
                 None,
             )
+        role = first_mismatch.get("palette_role") if first_mismatch else None
+        expected_color = (
+            first_mismatch.get("expected_brand_color")
+            if first_mismatch
+            else None
+        )
+        if expected_color and role in {"primary", "secondary", "accent"}:
+            suggestion = (
+                "Check whether the detected colour {0} should use the configured "
+                "{1} brand colour {2}; adjust it only if the difference is "
+                "unintended.".format(
+                    first_mismatch["image_color"], role, expected_color
+                )
+            )
+        else:
+            suggestion = (
+                "Compare the detected colour with the expected brand colours and "
+                "update it only if the difference is unintended."
+            )
         add_finding(
             "Image colours may differ from the approved brand palette",
             "visual_brand",
             guideline.severity if guideline else "medium",
             "A measured dominant colour differs from the configured or guideline palette using an approximate RGB-distance heuristic. Human visual review is required.",
-            "Compare the image with the approved palette and update only if the difference is unintended.",
+            suggestion,
             palette["method"],
             actual=first_mismatch["image_color"] if first_mismatch else None,
             expected=expected_colors or palette.get("expected_colors") or None,
             confidence=None,
             guideline=guideline,
-            extra={"palette_comparison": palette},
+            extra={
+                "palette_comparison": palette,
+                "expected_brand_color": expected_color,
+                "nearest_detected_color": (
+                    first_mismatch.get("nearest_detected_color")
+                    if first_mismatch
+                    else None
+                ),
+                "approximate_color_distance": (
+                    first_mismatch.get("nearest_brand_color_distance")
+                    if first_mismatch
+                    else None
+                ),
+                "palette_role": role,
+            },
         )
 
     similarity = image_info.get("brand_asset_similarity")
@@ -280,7 +274,7 @@ def _image_findings(
         add_finding(
             "Detected text may have insufficient contrast",
             "accessibility",
-            "high",
+            "medium",
             "OCR estimated a text/background contrast ratio of {0}:1 against an approximate WCAG AA threshold of {1}:1. Automated colour sampling may misidentify text or its background and is not a complete accessibility audit.".format(
                 contrast["contrast_ratio"], contrast["threshold"]
             ),
@@ -305,21 +299,23 @@ def analyze_visual_file(
     file_bytes: bytes,
     guidelines,
     approved_logo_assets,
+    resolved_palette: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if not file_bytes:
         raise ValueError("Uploaded visual file is empty.")
     if len(file_bytes) > MAX_UPLOAD_SIZE:
         raise ValueError("Image or PDF exceeds the configured maximum upload size.")
     validated_media_type = validate_visual_upload(filename, media_type, file_bytes)
-    guideline_colors = _guideline_colors(guidelines)
-    approved_colors = [item["color"] for item in guideline_colors]
+    guideline_colors = guideline_palette_colors(guidelines)
+    if resolved_palette is None:
+        resolved_palette = resolve_visual_palette(None, guidelines)
     findings = []
     if validated_media_type != "application/pdf":
         image_info = inspect_image(
             file_bytes,
             OCR_ENABLED,
             approved_asset_references=approved_logo_assets,
-            approved_colors=approved_colors,
+            resolved_palette=resolved_palette,
         )
         findings.extend(_image_findings(image_info, 1, None, guidelines))
         image_info["pages"] = [
@@ -339,6 +335,7 @@ def analyze_visual_file(
         return image_info, findings
 
     reader = _read_pdf(file_bytes)
+    extracted_pages = extract_pdf_pages(file_bytes)
     pages = []
     limitations = []
     extracted_text_length = 0
@@ -346,10 +343,9 @@ def analyze_visual_file(
     total_embedded_image_bytes = 0
     for page_index, page in enumerate(reader.pages):
         page_number = page_index + 1
-        try:
-            page_text = page.extract_text() or ""
-        except (KeyError, ValueError, OSError, PdfReadError):
-            page_text = ""
+        extracted_page = extracted_pages[page_index]
+        page_text = extracted_page["text"]
+        if extracted_page["text_extraction_failed"]:
             limitations.append(
                 "Page {} text extraction failed; the page was not silently treated as analyzed.".format(
                     page_number
@@ -365,13 +361,14 @@ def analyze_visual_file(
         page_result = {
             "page_number": page_number,
             "text": page_text,
-            "text_layer_detected": bool(page_text.strip()),
+            "text_layer_detected": extracted_page["text_layer_detected"],
+            "ocr_used": extracted_page["ocr_used"],
             "text_characters": len(page_text),
             "images": [],
             "rasterized": False,
             "limitations": [
                 "Full page rendering is unavailable; page layout, vector artwork, and placement were not raster-analyzed."
-            ],
+            ] + extracted_page["limitations"],
         }
         try:
             embedded_images = list(page.images)
@@ -417,7 +414,7 @@ def analyze_visual_file(
                     image_bytes,
                     OCR_ENABLED,
                     approved_asset_references=approved_logo_assets,
-                    approved_colors=approved_colors,
+                    resolved_palette=resolved_palette,
                 )
             except ImageAnalysisConfigurationError:
                 raise
@@ -482,6 +479,10 @@ def visual_analysis_summary(report: Dict[str, Any]) -> Dict[str, Any]:
                 {
                     "page_number": page.get("page_number"),
                     "text_layer_detected": page.get("text_layer_detected", False),
+                    "ocr_used": page.get("ocr_used", False),
+                    "text_extraction_failed": page.get(
+                        "text_extraction_failed", False
+                    ),
                     "text_characters": page.get("text_characters", 0),
                     "images": [
                         _image_summary(image)

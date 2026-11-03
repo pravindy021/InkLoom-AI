@@ -112,9 +112,23 @@ const emptyBrandVoiceConfiguration = {
 let brandVoiceConfiguration = { ...emptyBrandVoiceConfiguration };
 let brandVoiceVersion = 0;
 const brandVoiceHistory = [];
+const emptyVisualBrandPalette = {
+  primary: [],
+  secondary: [],
+  accent: [],
+};
+let visualBrandPalette = { ...emptyVisualBrandPalette };
+let visualBrandVersion = 0;
+const visualBrandHistory = [];
 
 export const mockApi = {
   health: () => wait({ status: "ok", mode: "mock", password_recovery_enabled: false }),
+  downloadReviewReport: async () => {
+    throw new Error("Review reports are unavailable in mock mode.");
+  },
+  downloadAnalyticsReport: async () => {
+    throw new Error("Analytics exports are unavailable in mock mode.");
+  },
   requestPasswordRecovery: async () => {
     throw new Error("Password recovery is unavailable in mock mode.");
   },
@@ -172,6 +186,42 @@ export const mockApi = {
     });
   },
   brandVoiceVersions: () => wait([...brandVoiceHistory]),
+  visualBrandPalette: () =>
+    wait({
+      ...visualBrandPalette,
+      version_number: visualBrandVersion,
+      updated_by: visualBrandVersion ? "Mock workspace" : null,
+      created_at: visualBrandHistory.at(-1)?.created_at || null,
+      updated_at: visualBrandHistory[0]?.created_at || null,
+    }),
+  updateVisualBrandPalette: async (data) => {
+    const palette = Object.fromEntries(
+      Object.entries(emptyVisualBrandPalette).map(([group]) => [
+        group,
+        [...(data[group] || [])],
+      ]),
+    );
+    if (JSON.stringify(palette) !== JSON.stringify(visualBrandPalette)) {
+      visualBrandVersion += 1;
+      visualBrandPalette = palette;
+      visualBrandHistory.unshift({
+        id: `visual-brand-${visualBrandVersion}`,
+        version_number: visualBrandVersion,
+        snapshot: { ...palette },
+        editor_id: "mock",
+        editor: "Mock workspace",
+        created_at: new Date().toISOString(),
+      });
+    }
+    return wait({
+      ...visualBrandPalette,
+      version_number: visualBrandVersion,
+      updated_by: visualBrandVersion ? "Mock workspace" : null,
+      created_at: visualBrandHistory.at(-1)?.created_at || null,
+      updated_at: visualBrandHistory[0]?.created_at || null,
+    });
+  },
+  visualBrandPaletteVersions: () => wait([...visualBrandHistory]),
   createGuideline: async (data) => {
     const now = new Date().toISOString();
     const item = { ...data, id: `g${Date.now()}`, status: "approved", created_at: now, updated_at: now, version: 1 };
@@ -342,14 +392,34 @@ export const mockApi = {
   },
   reviews: ({ offset = 0, limit = 20, status } = {}) => {
     const filtered = status && status !== "all"
-      ? reviews.filter((review) => review.status === status)
-      : reviews;
+      ? reviews.filter((review) => !review.archived_at && review.status === status)
+      : reviews.filter((review) => !review.archived_at);
     return wait({
       items: filtered.slice(offset, offset + limit),
       total: filtered.length,
       offset,
       limit,
     });
+  },
+  deleteReview: async (id) => {
+    const item = reviews.find(
+      (review) => String(review.id) === String(id) && !review.archived_at,
+    );
+    if (!item) throw new Error("Review not found.");
+    const archivedAt = new Date().toISOString();
+    item.archived_at = archivedAt;
+    item.archived_by = "Mock Admin";
+    item.activity = [
+      ...(item.activity || []),
+      {
+        id: `activity-${Date.now()}`,
+        action: "review_archived",
+        actor: "Mock Admin",
+        created_at: archivedAt,
+        details: { action: "archived", archived_at: archivedAt },
+      },
+    ];
+    return wait({ id: item.id, archived_at: archivedAt });
   },
   reviewers: () => wait([]),
   assignReviewer: async (id, reviewerId) => {
@@ -450,4 +520,31 @@ export const mockApi = {
     frequent_guidelines: [{ name: "Confident, never boastful", count: 16 }, { name: "Substantiated claims", count: 12 }, { name: "Product vocabulary", count: 9 }],
   }),
   blindSpots: () => wait([{ guideline: "Inclusive language", ambiguity_score: 0.72, mentions: 8 }, { guideline: "Sustainability claims", ambiguity_score: 0.58, mentions: 5 }]),
+  governanceInsights: () => wait({
+    issue_counts: {
+      unique_findings: 0,
+      duplicate_finding_records_ignored: 0,
+      by_category: [],
+      by_severity: {},
+      by_finding_status: {},
+      resolved: 0,
+      unresolved: 0,
+      status_unknown: 0,
+    },
+    recurring_categories: [],
+    guideline_recurrence: [],
+    review_outcomes: {
+      changes_requested_events: 0,
+      approved_events: 0,
+      interpretation: "Demo mode has no persisted governance insight data.",
+    },
+    trends_by_month: [],
+    recommendations: [],
+    data_quality: {
+      finding_records: 0,
+      unique_finding_records: 0,
+      missing_review_timestamps: 0,
+    },
+    date_range: { start_date: null, end_date: null },
+  }),
 };

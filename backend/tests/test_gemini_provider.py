@@ -274,7 +274,8 @@ def test_gemini_provider_error_keeps_deterministic_analysis_available(
         json={
             "content": (
                 "Our service guarantees 100% success for every customer."
-            )
+            ),
+            "allow_external_ai_processing": True,
         },
     )
 

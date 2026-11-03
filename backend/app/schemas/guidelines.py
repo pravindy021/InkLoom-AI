@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Annotated, List, Literal, Optional
 from urllib.parse import urlsplit
@@ -234,3 +235,56 @@ class BrandVoiceConfigurationUpdate(BaseModel):
                 "an expression cannot be both preferred and prohibited"
             )
         return self
+
+
+class VisualBrandPaletteUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary: List[str] = Field(default_factory=list, max_length=10)
+    secondary: List[str] = Field(default_factory=list, max_length=10)
+    accent: List[str] = Field(default_factory=list, max_length=10)
+
+    @field_validator("primary", "secondary", "accent", mode="before")
+    @classmethod
+    def normalize_hex_colors(cls, values):
+        if not isinstance(values, list):
+            return values
+        normalized = []
+        seen = set()
+        for value in values:
+            if not isinstance(value, str) or re.fullmatch(
+                r"#[0-9A-Fa-f]{6}", value
+            ) is None:
+                raise ValueError("colors must be six-digit HEX values")
+            value = value.upper()
+            if value in seen:
+                raise ValueError("colors must be unique within each group")
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_palette(self):
+        colors = self.primary + self.secondary + self.accent
+        if len(colors) > 20:
+            raise ValueError("palette cannot contain more than 20 colors")
+        if len(colors) != len(set(colors)):
+            raise ValueError("colors must be unique across the palette")
+        return self
+
+
+class VisualBrandPaletteRead(BaseModel):
+    primary: List[str] = Field(default_factory=list)
+    secondary: List[str] = Field(default_factory=list)
+    accent: List[str] = Field(default_factory=list)
+    version_number: int
+    updated_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class VisualBrandPaletteVersionRead(BaseModel):
+    version_number: int
+    snapshot: VisualBrandPaletteUpdate
+    editor: Optional[str] = None
+    created_at: datetime

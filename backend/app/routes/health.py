@@ -10,6 +10,7 @@ from app.config import (
     PALETTE_TOLERANCE,
     SMTP_ENABLED,
     TRUSTED_SOURCE_DOMAINS,
+    VIDEO_TRANSCRIPTION_ENABLED,
 )
 from app.services.llm_analyzer import llm_enabled
 
@@ -39,4 +40,5 @@ def health():
         "brand_palette": BRAND_PALETTE,
         "brand_asset_references_configured": len(BRAND_ASSET_REFERENCES),
         "collaboration": "websocket_process_local",
+        "video_transcription_configured": VIDEO_TRANSCRIPTION_ENABLED,
     }

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link, NavLink, Outlet } from "react-router-dom";
-import { Activity, BookOpenText, CheckCheck, ChevronLeft, ChevronRight, FileText, LayoutDashboard, LogOut, Menu, Settings2, ShieldCheck, X, LibraryBig, Users, Images } from "lucide-react";
+import { Activity, BookOpenText, CheckCheck, ChevronLeft, ChevronRight, FileText, LayoutDashboard, LogOut, Menu, Settings2, ShieldCheck, X, LibraryBig, Users, Images, Palette } from "lucide-react";
 import { MOCK_MODE } from "../../services/api";
 import { useAuth } from "../../contexts/AuthContext";
 
@@ -35,7 +35,10 @@ export default function AppShell() {
     </div>
     <nav className="flex-1 space-y-1 px-3 py-5" aria-label="Main navigation">
       {!collapsed && <p className="mb-3 px-3 text-[10px] font-bold uppercase tracking-[.16em] text-slate-400">Workspace</p>}
-      {[...links, ...(user?.role === "admin" ? [{ to: "/admin", label: "Admin dashboard", icon: Users }] : [])].map(({ to, label, icon: Icon, end }) => <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined} onClick={() => setMobileOpen(false)} className={({ isActive }) => `group flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${isActive ? "bg-ink-50 text-ink-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-800"} ${collapsed ? "justify-center" : ""}`}><Icon size={18} strokeWidth={1.8} /><span className={collapsed ? "lg:hidden" : ""}>{label}</span></NavLink>)}
+      {[...links, ...(user?.role === "admin" ? [
+        { to: "/visual-brand", label: "Brand palette", icon: Palette },
+        { to: "/admin", label: "Admin dashboard", icon: Users },
+      ] : [])].map(({ to, label, icon: Icon, end }) => <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined} onClick={() => setMobileOpen(false)} className={({ isActive }) => `group flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${isActive ? "bg-ink-50 text-ink-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-800"} ${collapsed ? "justify-center" : ""}`}><Icon size={18} strokeWidth={1.8} /><span className={collapsed ? "lg:hidden" : ""}>{label}</span></NavLink>)}
     </nav>
     <div className="border-t border-slate-100 p-3">
       <NavLink to="/settings" title={collapsed ? "Settings" : undefined} className={({ isActive }) => `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium ${isActive ? "bg-ink-50 text-ink-700" : "text-slate-500 hover:bg-slate-50"} ${collapsed ? "justify-center" : ""}`}><Settings2 size={18} /><span className={collapsed ? "lg:hidden" : ""}>Settings</span></NavLink>

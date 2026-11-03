@@ -73,3 +73,18 @@ class ReviewVisualAttachment(Base):
 
     review = relationship("ContentReview", back_populates="visual_attachment")
     uploaded_by = relationship("User")
+
+
+class ReviewVideoFrame(Base):
+    __tablename__ = "review_video_frames"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    review_id: Mapped[int] = mapped_column(
+        ForeignKey("content_reviews.id", ondelete="CASCADE"), index=True
+    )
+    frame_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    timestamp_seconds: Mapped[float] = mapped_column(nullable=False)
+    media_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    file_data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    review = relationship("ContentReview")

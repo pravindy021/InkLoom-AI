@@ -130,6 +130,7 @@ class PublishOverrideCreate(BaseModel):
 class RevisionCreate(BaseModel):
     content: str = Field(min_length=1, max_length=100_000)
     title: Optional[str] = Field(default=None, max_length=240)
+    allow_external_ai_processing: bool = False
 
     @field_validator("content")
     @classmethod

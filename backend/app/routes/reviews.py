@@ -46,7 +46,7 @@ from app.models.review_publish import (
 )
 from app.models.source_document import SourceDocument
 from app.models.user import User
-from app.models.visual_asset import ReviewVisualAttachment
+from app.models.visual_asset import ReviewVideoFrame, ReviewVisualAttachment
 
 from app.schemas.reviews import (
     AssignmentUpdate,
@@ -67,6 +67,7 @@ from app.services.risk_intelligence import (
     calculate_risk,
     evaluate_publish_readiness,
 )
+from app.services.report_exports import review_report_pdf
 from app.services.freshness_service import source_freshness
 from app.services.claim_checker import (
     check_promotional_claims,
@@ -83,7 +84,7 @@ from app.services.source_access import apply_source_visibility
 from app.services.text_analyzer import analyze_text
 from app.services.auth_service import authenticate_token, require_roles
 
-from app.config import MAX_CONTENT_LENGTH, CORS_ORIGINS
+from app.config import CORS_ORIGINS, EMBEDDINGS_ENABLED, MAX_CONTENT_LENGTH
 
 
 router = APIRouter(
@@ -296,7 +297,7 @@ def list_reviews(
         require_roles("admin", "reviewer", "contributor")
     ),
 ):
-    query = db.query(ContentReview)
+    query = db.query(ContentReview).filter(ContentReview.archived_at.is_(None))
     if _user.role == "contributor":
         query = query.filter(ContentReview.submitted_by_id == _user.id)
 
@@ -853,6 +854,65 @@ def get_review(
     return review_payload(review, _user)
 
 
+@router.delete("/{review_id}")
+def archive_review(
+    review_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_roles("admin")),
+):
+    review = _get_review(db, review_id, for_update=True)
+    if review.archived_at is not None:
+        raise HTTPException(status_code=409, detail="Review is already archived.")
+
+    archived_at = datetime.now(timezone.utc)
+    review.archived_at = archived_at
+    review.archived_by_id = admin.id
+    record_activity(
+        db,
+        review.id,
+        "review_archived",
+        actor=admin.display_name,
+        details={
+            "action": "archived",
+            "archived_at": archived_at.isoformat(),
+        },
+    )
+    db.commit()
+    return {
+        "id": review.id,
+        "archived_at": archived_at,
+        "archived_by_id": admin.id,
+    }
+
+
+@router.get("/{review_id}/report.pdf")
+def download_review_report(
+    review_id: int,
+    db: Session = Depends(get_db),
+    viewer: User = Depends(
+        require_roles("admin", "reviewer", "contributor")
+    ),
+):
+    review = _get_review(db, review_id)
+    _authorize_review_access(review, viewer)
+    activities = (
+        db.query(ReviewActivity)
+        .filter(ReviewActivity.review_id == review_id)
+        .order_by(ReviewActivity.created_at.asc(), ReviewActivity.id.asc())
+        .all()
+    )
+    response = Response(
+        content=review_report_pdf(review, viewer, activities),
+        media_type="application/pdf",
+    )
+    response.headers["Content-Disposition"] = (
+        'attachment; filename="inkloom-review-{}.pdf"'.format(review_id)
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
 @router.get("/{review_id}/visual-attachment")
 def get_review_visual_attachment(
     review_id: int,
@@ -871,9 +931,15 @@ def get_review_visual_attachment(
     if attachment is None:
         raise HTTPException(status_code=404, detail="This review has no visual attachment.")
     response = Response(content=attachment.file_data, media_type=attachment.media_type)
+    disposition = (
+        "attachment"
+        if attachment.media_type
+        == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        else "inline"
+    )
     response.headers["Content-Disposition"] = (
-        'inline; filename="review-{}.{}"'.format(
-            review_id, attachment.filename.rsplit(".", 1)[-1]
+        '{}; filename="review-{}.{}"'.format(
+            disposition, review_id, attachment.filename.rsplit(".", 1)[-1]
         )
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -881,6 +947,39 @@ def get_review_visual_attachment(
     response.headers["Cross-Origin-Resource-Policy"] = "same-site"
     if attachment.media_type == "application/pdf":
         response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+    return response
+
+
+@router.get("/{review_id}/video-frames/{frame_index}")
+def get_review_video_frame(
+    review_id: int,
+    frame_index: int,
+    db: Session = Depends(get_db),
+    viewer: User = Depends(
+        require_roles("admin", "reviewer", "contributor")
+    ),
+):
+    review = _get_review(db, review_id)
+    _authorize_review_access(review, viewer)
+    frame = (
+        db.query(ReviewVideoFrame)
+        .filter(
+            ReviewVideoFrame.review_id == review_id,
+            ReviewVideoFrame.frame_index == frame_index,
+        )
+        .first()
+    )
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Video frame not found.")
+    response = Response(content=frame.file_data, media_type=frame.media_type)
+    response.headers["Content-Disposition"] = (
+        'inline; filename="review-{}-frame-{}.jpg"'.format(
+            review_id, frame_index
+        )
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-site"
     return response
 
 
@@ -1907,7 +2006,11 @@ async def reanalyze_revision(
 
     evidence_by_claim = {}
     evidence_matches = []
-    evidence_retrieval_method = retrieval_method()
+    evidence_retrieval_method = (
+        retrieval_method()
+        if payload.allow_external_ai_processing
+        else "bm25_lexical"
+    )
     warnings = []
     embedding_failed = False
 
@@ -1919,7 +2022,7 @@ async def reanalyze_revision(
             )
             evidence_retrieval_method = "bm25_lexical_fallback"
 
-        else:
+        elif payload.allow_external_ai_processing:
             try:
                 matches, evidence_retrieval_method = await retrieve_evidence(
                     claim,
@@ -1942,6 +2045,9 @@ async def reanalyze_revision(
                         str(exc)
                     )
                 )
+        else:
+            matches = retrieve_lexical_evidence(claim, sources)
+            evidence_retrieval_method = "bm25_lexical"
 
         evidence_by_claim[claim.casefold()] = matches
 
@@ -1954,6 +2060,18 @@ async def reanalyze_revision(
                 evidence_matches.append(match)
 
     brand_voice = db.get(BrandVoiceConfiguration, 1)
+    if EMBEDDINGS_ENABLED:
+        warnings.append(
+            (
+                "Per-revision consent was granted for configured embedding "
+                "processing."
+            )
+            if payload.allow_external_ai_processing
+            else (
+                "Remote embedding processing was not opted in; the configured "
+                "embedding provider was not sent content."
+            )
+        )
     findings = analyze_text(
         payload.content,
         guidelines,

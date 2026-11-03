@@ -189,6 +189,7 @@ def inspect_image(
     ocr_enabled: bool = False,
     approved_asset_references: Optional[List[Dict[str, Any]]] = None,
     approved_colors: Optional[List[str]] = None,
+    resolved_palette: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     try:
         with Image.open(BytesIO(image_bytes)) as image:
@@ -224,13 +225,40 @@ def inspect_image(
                     {"hex": "#{:02X}{:02X}{:02X}".format(*rgb), "pixel_share": round(count / (256 * 256), 3)}
                 )
 
+    if resolved_palette is None:
+        palette_colors = [
+            {"color": color.upper(), "role": "environment"}
+            for color in BRAND_PALETTE
+        ] + [
+            {"color": color.upper(), "role": "guideline"}
+            for color in approved_colors or []
+        ]
+        palette_source = "environment" if BRAND_PALETTE else (
+            "guidelines" if approved_colors else "none"
+        )
+        palette_tolerance = PALETTE_TOLERANCE
+    else:
+        palette_colors = resolved_palette.get("colors", [])
+        palette_source = resolved_palette.get("source", "none")
+        palette_tolerance = resolved_palette.get("tolerance", PALETTE_TOLERANCE)
+
     configured_colors = []
-    for color in list(BRAND_PALETTE) + list(approved_colors or []):
+    for item in palette_colors:
+        color = item.get("color", "")
         normalized = color.lstrip("#")
         if len(normalized) == 6:
             try:
                 configured_colors.append(
-                    tuple(int(normalized[index : index + 2], 16) for index in (0, 2, 4))
+                    {
+                        "rgb": tuple(
+                            int(normalized[index : index + 2], 16)
+                            for index in (0, 2, 4)
+                        ),
+                        "hex": "#" + normalized.upper(),
+                        "role": item.get("role"),
+                        "guideline_id": item.get("guideline_id"),
+                        "guideline": item.get("guideline"),
+                    }
                 )
             except ValueError:
                 continue
@@ -243,22 +271,49 @@ def inspect_image(
             image_rgb = tuple(
                 int(color["hex"][index : index + 2], 16) for index in (1, 3, 5)
             )
-            nearest_distance = min(
-                math.sqrt(sum((actual - expected) ** 2 for actual, expected in zip(image_rgb, reference)))
-                for reference in configured_colors
+            nearest = min(
+                configured_colors,
+                key=lambda reference: math.sqrt(
+                    sum(
+                        (actual - expected) ** 2
+                        for actual, expected in zip(image_rgb, reference["rgb"])
+                    )
+                ),
+            )
+            nearest_distance = math.sqrt(
+                sum(
+                    (actual - expected) ** 2
+                    for actual, expected in zip(image_rgb, nearest["rgb"])
+                )
             )
             comparisons.append(
                 {
                     "image_color": color["hex"],
+                    "nearest_detected_color": color["hex"],
+                    "expected_brand_color": nearest["hex"],
+                    "palette_role": nearest["role"],
+                    "guideline_id": nearest["guideline_id"],
+                    "guideline": nearest["guideline"],
                     "nearest_brand_color_distance": round(nearest_distance, 1),
-                    "within_tolerance": nearest_distance <= PALETTE_TOLERANCE,
+                    "within_tolerance": nearest_distance <= palette_tolerance,
                 }
             )
         palette_comparison = {
-            "method": "Euclidean RGB distance approximation; not perceptually uniform",
-            "tolerance": PALETTE_TOLERANCE,
-            "expected_colors": [
-                "#{:02X}{:02X}{:02X}".format(*color)
+            "method": (
+                resolved_palette.get("method")
+                if resolved_palette
+                else "Euclidean RGB distance approximation; not perceptually uniform"
+            ),
+            "source": palette_source,
+            "tolerance": palette_tolerance,
+            "expected_colors": [color["hex"] for color in configured_colors],
+            "expected_color_details": [
+                {
+                    "color": color["hex"],
+                    "role": color["role"],
+                    "guideline_id": color["guideline_id"],
+                    "guideline": color["guideline"],
+                }
                 for color in configured_colors
             ],
             "colors": comparisons,

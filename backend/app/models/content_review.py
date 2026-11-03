@@ -16,6 +16,12 @@ class ContentReview(Base):
     content_type: Mapped[str] = mapped_column(String(80), nullable=False, default="text")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     reviewer: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    archived_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    archived_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     submitted_by_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -48,6 +54,7 @@ class ContentReview(Base):
         order_by="ReviewAnalysisRun.id",
     )
     assigned_reviewer = relationship("User", foreign_keys=[assigned_reviewer_id])
+    archived_by = relationship("User", foreign_keys=[archived_by_id])
     submitted_by = relationship("User", foreign_keys=[submitted_by_id])
     reviewer_assignments = relationship(
         "ReviewAssignment",

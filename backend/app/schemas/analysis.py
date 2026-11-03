@@ -4,20 +4,15 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class AnalysisRequest(BaseModel):
-    content: str = Field(min_length=1)
+    content: str = Field(default="", max_length=100_000)
     content_type: str = Field(default="text", min_length=1, max_length=80)
     title: Optional[str] = Field(default=None, max_length=240)
     guideline_ids: List[int] = Field(default_factory=list, max_length=100)
     source_ids: List[int] = Field(default_factory=list, max_length=100)
     alt_text: Optional[str] = Field(default=None, max_length=1000)
     allow_external_verification: bool = False
-
-    @field_validator("content")
-    @classmethod
-    def content_not_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("content cannot be blank")
-        return value
+    allow_external_transcription: bool = False
+    allow_external_ai_processing: bool = False
 
     @field_validator("content_type")
     @classmethod

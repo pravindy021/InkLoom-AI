@@ -4,6 +4,7 @@ from app.models.brand_guideline import (
     GuidelineVersion,
 )
 from app.models.brand_voice import BrandVoiceConfiguration, BrandVoiceVersion
+from app.models.visual_brand import VisualBrandConfiguration, VisualBrandVersion
 from app.models.content_review import (
     ContentReview,
     ReviewAnalysisRun,
@@ -30,7 +31,11 @@ from app.models.freshness import (
     FreshnessSchedulerLease,
 )
 from app.models.review_publish import ReviewPublication, ReviewPublishAuditEvent
-from app.models.visual_asset import ReviewVisualAttachment, VisualAsset
+from app.models.visual_asset import (
+    ReviewVideoFrame,
+    ReviewVisualAttachment,
+    VisualAsset,
+)
 from app.models.user import (
     AccountAuditEvent,
     AuthSession,
@@ -47,6 +52,8 @@ __all__ = [
     "GuidelineReviewEvent",
     "BrandVoiceConfiguration",
     "BrandVoiceVersion",
+    "VisualBrandConfiguration",
+    "VisualBrandVersion",
     "ContentReview",
     "ReviewFinding",
     "ReviewRevision",
@@ -68,6 +75,7 @@ __all__ = [
     "ReviewPublishAuditEvent",
     "VisualAsset",
     "ReviewVisualAttachment",
+    "ReviewVideoFrame",
     "User",
     "AuthSession",
     "LoginAttempt",

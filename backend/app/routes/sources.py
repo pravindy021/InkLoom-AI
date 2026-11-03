@@ -227,7 +227,7 @@ async def upload_source(
     if len(file_bytes) > MAX_SOURCE_UPLOAD_SIZE:
         raise HTTPException(status_code=413, detail="Source file exceeds the configured size limit.")
     try:
-        content = extract_source_text(filename, file_bytes)
+        content = extract_source_text(filename, file_bytes, file.content_type)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     source = SourceDocument(
