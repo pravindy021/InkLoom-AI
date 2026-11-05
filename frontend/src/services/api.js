@@ -1,6 +1,5 @@
 import { mockApi } from "./mockApi";
-
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
+export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "https://inkloom-ai-backend-y19c.onrender.com").replace(/\/$/, "");
 export const MOCK_MODE = import.meta.env.VITE_MOCK_API === "true";
 
 async function request(path, options = {}) {
