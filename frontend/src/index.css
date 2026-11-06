@@ -1,4 +1,4 @@
-@tailwind base;
+﻿@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
@@ -27,3 +27,4 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .field { @apply w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-800 placeholder:text-slate-400; }
   .eyebrow { @apply text-xs font-semibold uppercase tracking-[.12em] text-slate-400; }
 }
+

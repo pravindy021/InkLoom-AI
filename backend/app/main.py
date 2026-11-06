@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import API_VERSION, CORS_ORIGINS
 from app.database import Base, engine, get_db
 from app.models import BrandGuideline
-from app.routes import analytics, analysis, guidelines, health, reviews, sources
+from app.routes import analytics, analysis, auth, guidelines, health, reviews, sources
 
 SEED_GUIDELINES = [
     {
@@ -76,7 +76,8 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         allow_origins=CORS_ORIGINS,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "X-Reviewer"],
+        allow_headers=["Content-Type", "Authorization", "X-Reviewer"],
+        
     )
 
     def get_app_db():
@@ -93,6 +94,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     app.include_router(reviews.router)
     app.include_router(sources.router)
     app.include_router(analytics.router)
+    app.include_router(auth.router)
     return app
 
 

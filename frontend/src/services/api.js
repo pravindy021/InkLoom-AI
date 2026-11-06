@@ -1,9 +1,14 @@
-import { mockApi } from "./mockApi";
+﻿import { mockApi } from "./mockApi";
 export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "https://inkloom-ai-backend-y19c.onrender.com").replace(/\/$/, "");
 export const MOCK_MODE = import.meta.env.VITE_MOCK_API === "true";
 
 async function request(path, options = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, options);
+  const token = localStorage.getItem("inkloom_access_token");
+  const headers = {
+    ...(options.headers || {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+  const response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
   const raw = await response.text();
   let data;
   try {
@@ -74,3 +79,9 @@ export function unwrapList(value) {
 export function errorMessage(error) {
   return error instanceof Error ? error.message : "Something went wrong. Please try again.";
 }
+
+export const authApi = {
+  login: (credentials) => request("/api/auth/login", json("POST", credentials)),
+  me: () => request("/api/auth/me"),
+  acceptInvite: (data) => request("/api/auth/accept-invite", json("POST", data)),
+};

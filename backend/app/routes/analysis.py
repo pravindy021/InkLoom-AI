@@ -1,3 +1,4 @@
+
 import json
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -10,6 +11,7 @@ from starlette.formparsers import MultiPartException
 
 from app.config import MAX_CONTENT_LENGTH, MAX_UPLOAD_SIZE, OCR_ENABLED
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.models.brand_guideline import BrandGuideline
 from app.models.content_review import ContentReview, ReviewFinding
 from app.models.source_document import SourceDocument
@@ -28,35 +30,44 @@ router = APIRouter(prefix="/api", tags=["analysis"])
 async def _parse_request(request: Request):
     content_type = request.headers.get("content-type", "").lower()
     raw_content_length = request.headers.get("content-length")
+
     if raw_content_length:
         try:
             request_length = int(raw_content_length)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+
         maximum_request_length = (
             MAX_CONTENT_LENGTH + 16_384
             if "application/json" in content_type
             else MAX_CONTENT_LENGTH + MAX_UPLOAD_SIZE + 262_144
         )
+
         if request_length > maximum_request_length:
             raise HTTPException(status_code=413, detail="Request exceeds the configured size limit.")
 
     image_bytes: Optional[bytes] = None
+
     if "application/json" in content_type:
         try:
             raw = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
+
         if not isinstance(raw, dict):
             raise HTTPException(status_code=422, detail="JSON request body must be an object.")
+
         payload = raw
+
     elif "multipart/form-data" in content_type:
         try:
             form = await request.form()
         except (MultiPartException, ValueError, OSError):
             raise HTTPException(status_code=400, detail="Could not parse multipart form data.")
+
         raw_guideline_ids = form.get("guideline_ids", "[]")
         guideline_ids = _parse_id_list(raw_guideline_ids, "guideline_ids")
+
         payload = {
             "title": form.get("title"),
             "content": form.get("content", ""),
@@ -65,23 +76,30 @@ async def _parse_request(request: Request):
             "source_ids": _parse_id_list(form.get("source_ids", "[]"), "source_ids"),
             "alt_text": form.get("alt_text"),
         }
+
         uploaded = form.get("file")
+
         if uploaded is not None:
             if not isinstance(uploaded, UploadFile):
                 raise HTTPException(status_code=422, detail="file must be an uploaded image.")
+
             if uploaded.size is not None and uploaded.size > MAX_UPLOAD_SIZE:
                 raise HTTPException(
                     status_code=413,
                     detail="Image exceeds the configured maximum upload size.",
                 )
+
             image_bytes = await uploaded.read(MAX_UPLOAD_SIZE + 1)
+
             if len(image_bytes) > MAX_UPLOAD_SIZE:
                 raise HTTPException(
                     status_code=413,
                     detail="Image exceeds the configured maximum upload size.",
                 )
+
             if not image_bytes:
                 raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
     else:
         raise HTTPException(
             status_code=415,
@@ -93,10 +111,12 @@ async def _parse_request(request: Request):
             status_code=413,
             detail="Content exceeds the configured maximum length.",
         )
+
     try:
         validated = AnalysisRequest.model_validate(payload)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors(include_context=False))
+
     return validated, image_bytes
 
 
@@ -105,24 +125,33 @@ def _parse_id_list(value, field_name: str):
         parsed = json.loads(value) if isinstance(value, str) else value
     except json.JSONDecodeError:
         raise HTTPException(status_code=422, detail="{} must be a JSON array.".format(field_name))
+
     if not isinstance(parsed, list) or any(
         isinstance(item, bool) or not isinstance(item, int) or item < 1 for item in parsed
     ):
         raise HTTPException(status_code=422, detail="{} must contain positive integer IDs.".format(field_name))
+
     return parsed
 
 
 @router.post("/analyze")
-async def analyze_content(request: Request, db: Session = Depends(get_db)):
+async def analyze_content(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
     payload, image_bytes = await _parse_request(request)
+
     if payload.guideline_ids:
         guidelines = (
             db.query(BrandGuideline)
             .filter(BrandGuideline.id.in_(payload.guideline_ids))
             .all()
         )
+
         found_ids = {item.id for item in guidelines}
         missing_ids = sorted(set(payload.guideline_ids) - found_ids)
+
         if missing_ids:
             raise HTTPException(
                 status_code=422,
@@ -132,6 +161,7 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
         guidelines = db.query(BrandGuideline).all()
 
     source_query = db.query(SourceDocument)
+
     if payload.source_ids:
         source_query = source_query.filter(SourceDocument.id.in_(payload.source_ids))
     elif payload.guideline_ids:
@@ -139,21 +169,26 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
             (SourceDocument.guideline_id.is_(None))
             | (SourceDocument.guideline_id.in_(payload.guideline_ids))
         )
+
     sources = source_query.all()
+
     if payload.source_ids:
         found_source_ids = {item.id for item in sources}
         missing_source_ids = sorted(set(payload.source_ids) - found_source_ids)
+
         if missing_source_ids:
             raise HTTPException(
                 status_code=422,
                 detail="Unknown source id(s): {}.".format(", ".join(map(str, missing_source_ids))),
             )
+
     factual_excerpt = factual_claim_excerpt(payload.content)
     evidence_matches = (
         retrieve_evidence(factual_excerpt, sources) if factual_excerpt else []
     )
 
     image_info = None
+
     if image_bytes is not None:
         try:
             image_info = inspect_image(image_bytes, OCR_ENABLED)
@@ -161,6 +196,7 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
             raise HTTPException(status_code=422, detail=str(exc))
 
     analysis_text = payload.content
+
     if image_info and image_info.get("extracted_text"):
         analysis_text = "{}\n{}".format(analysis_text, image_info["extracted_text"])
 
@@ -171,12 +207,15 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
         alt_text=payload.alt_text,
         evidence_matches=evidence_matches,
     )
+
     analysis_engine = "rules"
+
     if llm_enabled():
         try:
             llm_findings = await analyze_with_llm(payload.content, guidelines, evidence_matches)
         except LLMProviderError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+
         known = {
             (
                 str(item.get("category", "")).casefold(),
@@ -184,16 +223,21 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
             )
             for item in findings
         }
+
         for item in llm_findings:
             key = (
                 str(item.get("category", "")).casefold(),
                 str(item.get("matched_text") or "").casefold(),
             )
+
             if key not in known:
                 findings.append(item)
                 known.add(key)
+
         analysis_engine = "rules+configured_llm"
+
     palette_result = image_info.get("palette_comparison") if image_info else None
+
     if palette_result and palette_result.get("potential_mismatch"):
         findings.append(
             {
@@ -209,6 +253,7 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
                 "confidence": None,
             }
         )
+
     review = ContentReview(
         title=(payload.title or "").strip() or "Untitled content",
         content=payload.content,
@@ -216,8 +261,10 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
         status="pending",
         guideline_ids=[item.id for item in guidelines],
     )
+
     db.add(review)
     db.flush()
+
     record_activity(
         db,
         review.id,
@@ -228,7 +275,9 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
             "image_attached": image_bytes is not None,
         },
     )
+
     finding_models: List[ReviewFinding] = []
+
     for item in findings:
         model = ReviewFinding(
             review_id=review.id,
@@ -243,10 +292,13 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
             confidence=item["confidence"],
             review_status="pending",
         )
+
         db.add(model)
         finding_models.append(model)
+
     db.commit()
     db.refresh(review)
+
     for finding in finding_models:
         db.refresh(finding)
 
@@ -254,11 +306,15 @@ async def analyze_content(request: Request, db: Session = Depends(get_db)):
         severity: sum(1 for finding in findings if finding["severity"] == severity)
         for severity in ("critical", "high", "medium", "low")
     }
+
     category_counts = {}
+
     for finding in findings:
         category = finding["category"]
         category_counts[category] = category_counts.get(category, 0) + 1
+
     overall_status = "needs_review" if findings else "no_issues_detected"
+
     return {
         "id": review.id,
         "review_id": review.id,

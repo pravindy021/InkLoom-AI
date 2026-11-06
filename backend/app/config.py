@@ -3,7 +3,7 @@ import re
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
 
 
 def _integer_setting(name: str, default: int, minimum: int) -> int:
@@ -51,3 +51,8 @@ if any(_llm_settings) and not all(_llm_settings):
     )
 LLM_ENABLED = all(_llm_settings)
 API_VERSION = "1.0.0"
+
+JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', '')
+JWT_ALGORITHM = 'HS256'
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")

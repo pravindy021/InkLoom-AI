@@ -1,10 +1,23 @@
+
+
 from datetime import date
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy.orm import Session
 
 from app.config import MAX_SOURCE_UPLOAD_SIZE
 from app.database import get_db
+from app.dependencies import get_current_user, require_admin
 from app.models.brand_guideline import BrandGuideline
 from app.models.source_document import SourceDocument
 from app.schemas.sources import SourceCreate
@@ -30,21 +43,39 @@ def _serialize(source: SourceDocument):
 def list_sources(
     guideline_id: int = Query(default=None, ge=1),
     db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
     query = db.query(SourceDocument)
+
     if guideline_id is not None:
         query = query.filter(SourceDocument.guideline_id == guideline_id)
-    return [_serialize(source) for source in query.order_by(SourceDocument.id.desc()).all()]
+
+    return [
+        _serialize(source)
+        for source in query.order_by(SourceDocument.id.desc()).all()
+    ]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_source(payload: SourceCreate, db: Session = Depends(get_db)):
-    if payload.guideline_id is not None and db.get(BrandGuideline, payload.guideline_id) is None:
-        raise HTTPException(status_code=422, detail="The selected guideline does not exist.")
+def create_source(
+    payload: SourceCreate,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    if (
+        payload.guideline_id is not None
+        and db.get(BrandGuideline, payload.guideline_id) is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="The selected guideline does not exist.",
+        )
+
     source = SourceDocument(**payload.model_dump())
     db.add(source)
     db.commit()
     db.refresh(source)
+
     return _serialize(source)
 
 
@@ -57,21 +88,44 @@ async def upload_source(
     source_date: date = Form(default=None),
     expiry_date: date = Form(default=None),
     db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
 ):
     filename = (file.filename or "").replace("\\", "/").split("/")[-1].strip()
+
     if not filename or any(ord(char) < 32 for char in filename):
-        raise HTTPException(status_code=422, detail="A valid source filename is required.")
-    if guideline_id is not None and db.get(BrandGuideline, guideline_id) is None:
-        raise HTTPException(status_code=422, detail="The selected guideline does not exist.")
+        raise HTTPException(
+            status_code=422,
+            detail="A valid source filename is required.",
+        )
+
+    if (
+        guideline_id is not None
+        and db.get(BrandGuideline, guideline_id) is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="The selected guideline does not exist.",
+        )
+
     if source_date and expiry_date and expiry_date < source_date:
-        raise HTTPException(status_code=422, detail="expiry_date cannot precede source_date.")
+        raise HTTPException(
+            status_code=422,
+            detail="expiry_date cannot precede source_date.",
+        )
+
     file_bytes = await file.read(MAX_SOURCE_UPLOAD_SIZE + 1)
+
     if len(file_bytes) > MAX_SOURCE_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail="Source file exceeds the configured size limit.")
+        raise HTTPException(
+            status_code=413,
+            detail="Source file exceeds the configured size limit.",
+        )
+
     try:
         content = extract_source_text(filename, file_bytes)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     source = SourceDocument(
         name=(name or "").strip()[:160] or filename[:160],
         content=content,
@@ -80,17 +134,29 @@ async def upload_source(
         source_date=source_date,
         expiry_date=expiry_date,
     )
+
     db.add(source)
     db.commit()
     db.refresh(source)
+
     return _serialize(source)
 
 
 @router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_source(source_id: int, db: Session = Depends(get_db)):
+def delete_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
     source = db.get(SourceDocument, source_id)
+
     if source is None:
-        raise HTTPException(status_code=404, detail="Approved source not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Approved source not found.",
+        )
+
     db.delete(source)
     db.commit()
+
     return Response(status_code=status.HTTP_204_NO_CONTENT)
